@@ -59,11 +59,11 @@ Gateway не отвечает за:
 ## Архитектура
 
 ```text
-┌─────────────┐       signed command        ┌────────────────────┐
-│  Service A  │ ──────────────────────────> │ PROXY_COMMANDS     │
+┌─────────────┐       signed command         ┌────────────────────┐
+│  Service A  │ ──────────────────────────>  │ PROXY_COMMANDS     │
 └─────────────┘          JetStream           └─────────┬──────────┘
-                                                      │ durable pull
-                                                      ▼
+                                                       │ durable pull
+                                                       ▼
                                              ┌───────────────────┐
                                              │ Command consumer  │
                                              │ verify + persist  │
@@ -336,12 +336,12 @@ Backoff экспоненциальный, ограниченный `MaxBackoff`,
 
 Gateway управляет четырьмя stream-ами:
 
-| Stream | Subjects | Назначение | Default retention |
-|---|---|---|---|
-| `PROXY_COMMANDS` | `proxy.commands.>` | Входящие команды | 7 дней |
-| `PROXY_RESULTS` | `proxy.results.>` | Результаты выполнения | 30 дней |
-| `PROXY_EVENTS` | `proxy.events.>` | Входящие внешние события | 30 дней |
-| `PROXY_DLQ` | `proxy.dlq.>` | Ошибки и rejected messages | 90 дней |
+| Stream           | Subjects           | Назначение                 | Default retention |
+| ---------------- | ------------------ | -------------------------- | ----------------- |
+| `PROXY_COMMANDS` | `proxy.commands.>` | Входящие команды           | 7 дней            |
+| `PROXY_RESULTS`  | `proxy.results.>`  | Результаты выполнения      | 30 дней           |
+| `PROXY_EVENTS`   | `proxy.events.>`   | Входящие внешние события   | 30 дней           |
+| `PROXY_DLQ`      | `proxy.dlq.>`      | Ошибки и rejected messages | 90 дней           |
 
 Для всех stream-ов используются:
 
@@ -473,54 +473,54 @@ Backpressure обеспечивают:
 
 ### Сервис и PostgreSQL
 
-| Переменная | Default | Описание |
-|---|---:|---|
-| `PROXY_HTTP_ADDR` | `:8080` | HTTP listen address |
-| `PROXY_DATABASE_URL` | required | PostgreSQL DSN |
-| `PROXY_DB_MAX_CONNS` | `32` | Максимум соединений одной replica |
-| `PROXY_WORKERS` | `16` | Operation workers |
-| `PROXY_OUTBOX_WORKERS` | `4` | Outbox publishers |
-| `PROXY_REQUEST_TIMEOUT` | `30s` | Timeout provider request |
-| `PROXY_SHUTDOWN_TIMEOUT` | `30s` | Максимальное graceful drain time |
-| `PROXY_RETENTION` | `720h` | DB retention completed data |
-| `PROXY_AUTO_MIGRATE` | `false` | Автомиграции при старте |
+| Переменная               |  Default | Описание                          |
+| ------------------------ | -------: | --------------------------------- |
+| `PROXY_HTTP_ADDR`        |  `:8080` | HTTP listen address               |
+| `PROXY_DATABASE_URL`     | required | PostgreSQL DSN                    |
+| `PROXY_DB_MAX_CONNS`     |     `32` | Максимум соединений одной replica |
+| `PROXY_WORKERS`          |     `16` | Operation workers                 |
+| `PROXY_OUTBOX_WORKERS`   |      `4` | Outbox publishers                 |
+| `PROXY_REQUEST_TIMEOUT`  |    `30s` | Timeout provider request          |
+| `PROXY_SHUTDOWN_TIMEOUT` |    `30s` | Максимальное graceful drain time  |
+| `PROXY_RETENTION`        |   `720h` | DB retention completed data       |
+| `PROXY_AUTO_MIGRATE`     |  `false` | Автомиграции при старте           |
 
 ### NATS и JetStream
 
-| Переменная | Default | Описание |
-|---|---:|---|
-| `PROXY_NATS_URL` | `nats://127.0.0.1:4222` | NATS servers URL |
-| `PROXY_NATS_CREDS_FILE` | empty | NATS credentials file |
-| `PROXY_NATS_CA_CERT` | empty | CA bundle |
-| `PROXY_NATS_CLIENT_CERT` | empty | mTLS certificate |
-| `PROXY_NATS_CLIENT_KEY` | empty | mTLS private key |
-| `PROXY_STREAM_REPLICAS` | `3` | Stream/consumer replicas |
-| `PROXY_STREAM_MAX_BYTES` | `10 GiB` | Лимит каждого stream |
-| `PROXY_MAX_MESSAGE_BYTES` | `2 MiB` | Максимум одного сообщения |
-| `PROXY_ACK_WAIT` | `1m` | Consumer ACK deadline |
-| `PROXY_MAX_ACK_PENDING` | `1024` | Consumer backpressure |
-| `PROXY_FETCH_BATCH` | `64` | Pull batch size |
+| Переменная                |                 Default | Описание                  |
+| ------------------------- | ----------------------: | ------------------------- |
+| `PROXY_NATS_URL`          | `nats://127.0.0.1:4222` | NATS servers URL          |
+| `PROXY_NATS_CREDS_FILE`   |                   empty | NATS credentials file     |
+| `PROXY_NATS_CA_CERT`      |                   empty | CA bundle                 |
+| `PROXY_NATS_CLIENT_CERT`  |                   empty | mTLS certificate          |
+| `PROXY_NATS_CLIENT_KEY`   |                   empty | mTLS private key          |
+| `PROXY_STREAM_REPLICAS`   |                     `3` | Stream/consumer replicas  |
+| `PROXY_STREAM_MAX_BYTES`  |                `10 GiB` | Лимит каждого stream      |
+| `PROXY_MAX_MESSAGE_BYTES` |                 `2 MiB` | Максимум одного сообщения |
+| `PROXY_ACK_WAIT`          |                    `1m` | Consumer ACK deadline     |
+| `PROXY_MAX_ACK_PENDING`   |                  `1024` | Consumer backpressure     |
+| `PROXY_FETCH_BATCH`       |                    `64` | Pull batch size           |
 
 ### Подписи
 
-| Переменная | Описание |
-|---|---|
-| `PROXY_REQUIRE_SIGNATURE` | Обязательность signatures; production — `true` |
-| `PROXY_SIGNING_PRIVATE_KEY_FILE` | Gateway ed25519 private key |
-| `PROXY_VERIFY_PUBLIC_KEYS` | Base64 public keys через запятую |
-| `PROXY_KEY_PERMISSIONS` | key ID → allowed command patterns |
+| Переменная                       | Описание                                       |
+| -------------------------------- | ---------------------------------------------- |
+| `PROXY_REQUIRE_SIGNATURE`        | Обязательность signatures; production — `true` |
+| `PROXY_SIGNING_PRIVATE_KEY_FILE` | Gateway ed25519 private key                    |
+| `PROXY_VERIFY_PUBLIC_KEYS`       | Base64 public keys через запятую               |
+| `PROXY_KEY_PERMISSIONS`          | key ID → allowed command patterns              |
 
 ### Provider example
 
-| Переменная | Описание |
-|---|---|
-| `PROXY_TRANSACTION_STATUS_ENDPOINT` | Fixed HTTPS endpoint |
-| `PROXY_PROVIDER_API_KEY_HEADER` | Имя auth header |
-| `PROXY_PROVIDER_API_KEY` | Provider credential |
-| `PROXY_PROVIDER_RPS` | Глобальный и локальный RPS limit |
-| `PROXY_WEBHOOK_PROVIDER` | Имя webhook provider-а |
-| `PROXY_WEBHOOK_SECRET` | HMAC secret |
-| `PROXY_WEBHOOK_EVENT_TYPES` | `external.type=internal.type;...` |
+| Переменная                          | Описание                          |
+| ----------------------------------- | --------------------------------- |
+| `PROXY_TRANSACTION_STATUS_ENDPOINT` | Fixed HTTPS endpoint              |
+| `PROXY_PROVIDER_API_KEY_HEADER`     | Имя auth header                   |
+| `PROXY_PROVIDER_API_KEY`            | Provider credential               |
+| `PROXY_PROVIDER_RPS`                | Глобальный и локальный RPS limit  |
+| `PROXY_WEBHOOK_PROVIDER`            | Имя webhook provider-а            |
+| `PROXY_WEBHOOK_SECRET`              | HMAC secret                       |
+| `PROXY_WEBHOOK_EVENT_TYPES`         | `external.type=internal.type;...` |
 
 ## Запуск
 
