@@ -1,0 +1,46 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: integration-gateway
+spec:
+  replicas: 3
+  selector:
+    matchLabels: {app: integration-gateway}
+  template:
+    metadata:
+      labels: {app: integration-gateway}
+    spec:
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: gateway
+          image: registry.example.com/integration-gateway@sha256:REPLACE_ME
+          ports:
+            - {name: http, containerPort: 8080}
+          envFrom:
+            - secretRef: {name: integration-gateway-secrets}
+            - configMapRef: {name: integration-gateway-config}
+          readinessProbe:
+            httpGet: {path: /health/ready, port: http}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /health/live, port: http}
+            periodSeconds: 10
+          resources:
+            requests: {cpu: 250m, memory: 256Mi}
+            limits: {cpu: "2", memory: 1Gi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: integration-gateway
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels: {app: integration-gateway}

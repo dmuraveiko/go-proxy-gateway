@@ -1,0 +1,25 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: integration-gateway
+spec:
+  podSelector:
+    matchLabels: {app: integration-gateway}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - namespaceSelector: {}
+      ports:
+        - {protocol: TCP, port: 8080}
+  egress:
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - {protocol: TCP, port: 4222}
+        - {protocol: TCP, port: 5432}
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+# Add explicit provider IP/CIDR egress rules per environment; deny-all remains the default.
