@@ -1,21 +1,60 @@
 # Operations runbook
 
-## Backlog
+## Рост очереди
 
-Check `/metrics`, PostgreSQL operation counts and JetStream consumer pending/ack floor. Do not purge command streams. Scale workers only after confirming provider and database limits.
+Проверить `/metrics`, доступность PostgreSQL/NATS, host limits и внешний HTTP. Рост
+`ready` может быть нормальным backpressure. Не увеличивать workers выше DB capacity и
+лимитов внешних host. Запросы не переупорядочивать вручную: Proxy порядка не обещает.
 
-## DLQ
+## Недоступен PostgreSQL
 
-Inspect `proxy.dlq.>` without logging secrets. Classify permanent contract errors, provider rejection and exhausted transient failures. Replay using the original command ID only after the root cause is fixed; deduplication prevents accidental duplicate DB operations.
+Proxy перестает подтверждать новые команды и не начинает HTTP без durable-флага
+`dispatching`. Workers, уже получившие HTTP-ответ, не повторяют HTTP, а пытаются
+сохранить тот же результат. Проверить disk space, WAL, pool, locks и HA failover.
 
 ## Unknown outcome
 
-Never blindly retry a payment/write after a timeout. Query the provider by idempotency key or transaction identifier, then transition it through a dedicated reconciliation workflow. Escalate unresolved operations to manual review.
+`unknown` означает: HTTP мог уйти наружу, но durable-результат потерян. Небезопасный
+request автоматически не повторять. Проверить внешний API по idempotency key/operation
+ID. Если reconciliation невозможна — передать на ручное решение владельцу операции.
+
+## Pending deliveries
+
+Проверить NATS connection, client subscription/ACL и клиентскую БД. Core NATS deliveries
+повторяются до прикладного ACK. Дубли ожидаемы и должны дедуплицироваться по delivery ID.
+
+## Host throttling
+
+При `429` или жалобах provider уменьшить `RPS`/`concurrency` override и выполнить rolling
+restart. Limiter общий через PostgreSQL. Connection pool локален каждому экземпляру,
+поэтому проверять также суммарные соединения всех replicas/NAT source IP.
+
+RPS считается в фиксированных секундных окнах: на границе окон возможен короткий
+burst. Если provider требует строгую паузу между запросами, текущей настройки RPS
+недостаточно — до запуска нужен отдельный `min_interval` limiter.
+
+## Webhook timeout
+
+Static mode зависит только от PostgreSQL commit. В delegated mode проверить responder,
+его NATS ACL и timeout. После `504` provider может повторить callback; responder обязан
+дедуплицировать бизнес-событие.
 
 ## Key rotation
 
-Deploy the new public key and permissions first, rotate producers, observe old-key traffic, then revoke the old key. Rotate the gateway signing key only after consumers trust both keys.
+Сначала добавить новый client public key/Proxy public key, затем перевести producer и
+только после отсутствия старого traffic удалить старый. Existing webhook URL продолжает
+работать; повтор старой register-команды после rotation signing key требует проверки.
 
 ## Disaster recovery
 
-Restore PostgreSQL to the agreed PITR point, restore/recover JetStream quorum, start migration job, then gateway. Compare pending operations and outbox with JetStream sequences before reopening traffic.
+Восстановить PostgreSQL до согласованной PITR-точки, затем Core NATS и Proxy. После
+старта истекшие `reserved` вернутся в `ready`, а истекшие `dispatching` станут `unknown`.
+Сверить pending deliveries и unknown до открытия traffic.
+
+## Миграции
+
+Текущая история схлопнута в одну `000001_initial` и предназначена для чистой БД. Если
+в базе уже отмечена выполненной старая миграция с тем же номером, остановить rollout:
+автоматически новая схема не применится. Для production подготовить отдельный
+переходный migration. Локальную тестовую базу без ценных данных можно пересоздать через
+`docker compose down -v`.

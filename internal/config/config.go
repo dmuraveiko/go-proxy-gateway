@@ -3,68 +3,77 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
 	"time"
 )
 
+type HostLimit struct {
+	RPS         int
+	Concurrency int
+}
+
 type Config struct {
-	HTTPAddr, DatabaseURL, NATSURL, NATSCredsFile                        string
-	NATSCACert, NATSClientCert, NATSClientKey                            string
-	CommandsStream, ResultsStream, EventsStream, DLQStream               string
-	CommandSubject, CommandDurable, ResultPrefix, EventPrefix, DLQPrefix string
-	StreamReplicas                                                       int
-	StreamMaxBytes                                                       int64
-	MaxMessageBytes                                                      int32
-	AckWait                                                              time.Duration
-	MaxAckPending, FetchBatch, OutboxWorkers                             int
-	SigningPrivateKeyFile                                                string
-	VerifyPublicKeys                                                     []string
-	KeyPermissions                                                       map[string][]string
-	RequireSignature                                                     bool
-	AutoMigrate                                                          bool
-	Workers                                                              int
-	DBMaxConns                                                           int32
-	RequestTimeout, ShutdownTimeout, Retention                           time.Duration
-	TransactionEndpoint, ProviderAPIKeyHeader, ProviderAPIKey            string
-	ProviderRPS                                                          int
-	WebhookProvider, WebhookSecret                                       string
-	WebhookEventTypes                                                    map[string]string
+	ProxyID, InstanceID, HTTPAddr, PublicBaseURL, DatabaseURL, NATSURL string
+	NATSCredsFile, NATSCACert, NATSClientCert, NATSClientKey           string
+	SigningPrivateKeyFile                                              string
+	ClientPublicKeys                                                   map[string]string
+	AllowedClients                                                     map[string]bool
+	RequireSignature, AutoMigrate                                      bool
+	Workers, DeliveryWorkers, DBMaxConns                               int
+	MaxMessageBytes, MaxRequestBytes, MaxResponseBytes                 int64
+	RequestTimeout, MaxRequestTimeout, DeliveryRetry                   time.Duration
+	DispatchLease, ShutdownTimeout, Retention, UnknownRetention        time.Duration
+	CleanupInterval                                                    time.Duration
+	DefaultHostLimit                                                   HostLimit
+	HostLimits                                                         map[string]HostLimit
+	WebhookDefaultMaxBody                                              int64
+	WebhookDefaultTimeout                                              time.Duration
 }
 
 func Load() (Config, error) {
-	c := Config{HTTPAddr: env("PROXY_HTTP_ADDR", ":8080"), DatabaseURL: os.Getenv("PROXY_DATABASE_URL"), NATSURL: env("PROXY_NATS_URL", "nats://127.0.0.1:4222"), NATSCredsFile: os.Getenv("PROXY_NATS_CREDS_FILE"), NATSCACert: os.Getenv("PROXY_NATS_CA_CERT"), NATSClientCert: os.Getenv("PROXY_NATS_CLIENT_CERT"), NATSClientKey: os.Getenv("PROXY_NATS_CLIENT_KEY"), CommandsStream: env("PROXY_COMMANDS_STREAM", "PROXY_COMMANDS"), ResultsStream: env("PROXY_RESULTS_STREAM", "PROXY_RESULTS"), EventsStream: env("PROXY_EVENTS_STREAM", "PROXY_EVENTS"), DLQStream: env("PROXY_DLQ_STREAM", "PROXY_DLQ"), CommandSubject: env("PROXY_COMMAND_SUBJECT", "proxy.commands.>"), CommandDurable: env("PROXY_COMMAND_DURABLE", "proxy-gateway"), ResultPrefix: env("PROXY_RESULT_PREFIX", "proxy.results"), EventPrefix: env("PROXY_EVENT_PREFIX", "proxy.events"), DLQPrefix: env("PROXY_DLQ_PREFIX", "proxy.dlq"), SigningPrivateKeyFile: os.Getenv("PROXY_SIGNING_PRIVATE_KEY_FILE"), VerifyPublicKeys: csv(os.Getenv("PROXY_VERIFY_PUBLIC_KEYS")), KeyPermissions: permissions(os.Getenv("PROXY_KEY_PERMISSIONS")), TransactionEndpoint: os.Getenv("PROXY_TRANSACTION_STATUS_ENDPOINT"), ProviderAPIKeyHeader: env("PROXY_PROVIDER_API_KEY_HEADER", "Authorization"), ProviderAPIKey: os.Getenv("PROXY_PROVIDER_API_KEY"), WebhookProvider: os.Getenv("PROXY_WEBHOOK_PROVIDER"), WebhookSecret: os.Getenv("PROXY_WEBHOOK_SECRET"), WebhookEventTypes: stringMap(os.Getenv("PROXY_WEBHOOK_EVENT_TYPES"))}
+	host, _ := os.Hostname()
+	c := Config{
+		ProxyID: env("PROXY_ID", "default"), InstanceID: env("PROXY_INSTANCE_ID", host),
+		HTTPAddr: env("PROXY_HTTP_ADDR", ":8080"), PublicBaseURL: env("PROXY_PUBLIC_BASE_URL", "http://localhost:8080"),
+		DatabaseURL: os.Getenv("PROXY_DATABASE_URL"), NATSURL: env("PROXY_NATS_URL", "nats://127.0.0.1:4222"),
+		NATSCredsFile: os.Getenv("PROXY_NATS_CREDS_FILE"), NATSCACert: os.Getenv("PROXY_NATS_CA_CERT"),
+		NATSClientCert: os.Getenv("PROXY_NATS_CLIENT_CERT"), NATSClientKey: os.Getenv("PROXY_NATS_CLIENT_KEY"),
+		SigningPrivateKeyFile: os.Getenv("PROXY_SIGNING_PRIVATE_KEY_FILE"),
+		ClientPublicKeys:      clientKeys(os.Getenv("PROXY_CLIENT_PUBLIC_KEYS")), AllowedClients: set(os.Getenv("PROXY_ALLOWED_CLIENTS")),
+		HostLimits: map[string]HostLimit{},
+	}
 	var err error
-	if c.StreamReplicas, err = intVal("PROXY_STREAM_REPLICAS", 3); err != nil {
-		return c, err
-	}
-	if c.StreamMaxBytes, err = int64Val("PROXY_STREAM_MAX_BYTES", 10<<30); err != nil {
-		return c, err
-	}
-	msg, e := intVal("PROXY_MAX_MESSAGE_BYTES", 2<<20)
-	if e != nil {
-		return c, e
-	}
-	c.MaxMessageBytes = int32(msg)
-	if c.MaxAckPending, err = intVal("PROXY_MAX_ACK_PENDING", 1024); err != nil {
-		return c, err
-	}
-	if c.FetchBatch, err = intVal("PROXY_FETCH_BATCH", 64); err != nil {
-		return c, err
-	}
-	if c.OutboxWorkers, err = intVal("PROXY_OUTBOX_WORKERS", 4); err != nil {
-		return c, err
-	}
 	if c.Workers, err = intVal("PROXY_WORKERS", 16); err != nil {
 		return c, err
 	}
-	db, e := intVal("PROXY_DB_MAX_CONNS", 32)
-	if e != nil {
-		return c, e
+	if c.DeliveryWorkers, err = intVal("PROXY_DELIVERY_WORKERS", 4); err != nil {
+		return c, err
 	}
-	c.DBMaxConns = int32(db)
-	if c.ProviderRPS, err = intVal("PROXY_PROVIDER_RPS", 20); err != nil {
+	if c.DBMaxConns, err = intVal("PROXY_DB_MAX_CONNS", 32); err != nil {
+		return c, err
+	}
+	if c.MaxMessageBytes, err = int64Val("PROXY_MAX_MESSAGE_BYTES", 8<<20); err != nil {
+		return c, err
+	}
+	if c.MaxRequestBytes, err = int64Val("PROXY_MAX_REQUEST_BYTES", 4<<20); err != nil {
+		return c, err
+	}
+	if c.MaxResponseBytes, err = int64Val("PROXY_MAX_RESPONSE_BYTES", 4<<20); err != nil {
+		return c, err
+	}
+	if c.WebhookDefaultMaxBody, err = int64Val("PROXY_WEBHOOK_MAX_BODY_BYTES", 4<<20); err != nil {
+		return c, err
+	}
+	if c.DefaultHostLimit.RPS, err = intVal("PROXY_DEFAULT_HOST_RPS", 20); err != nil {
+		return c, err
+	}
+	if c.DefaultHostLimit.Concurrency, err = intVal("PROXY_DEFAULT_HOST_CONCURRENCY", 8); err != nil {
+		return c, err
+	}
+	if c.HostLimits, err = hostLimits(os.Getenv("PROXY_HOST_LIMITS")); err != nil {
 		return c, err
 	}
 	if c.RequireSignature, err = boolVal("PROXY_REQUIRE_SIGNATURE", true); err != nil {
@@ -73,10 +82,16 @@ func Load() (Config, error) {
 	if c.AutoMigrate, err = boolVal("PROXY_AUTO_MIGRATE", false); err != nil {
 		return c, err
 	}
-	if c.AckWait, err = durationVal("PROXY_ACK_WAIT", time.Minute); err != nil {
+	if c.RequestTimeout, err = durationVal("PROXY_REQUEST_TIMEOUT", 30*time.Second); err != nil {
 		return c, err
 	}
-	if c.RequestTimeout, err = durationVal("PROXY_REQUEST_TIMEOUT", 30*time.Second); err != nil {
+	if c.MaxRequestTimeout, err = durationVal("PROXY_MAX_REQUEST_TIMEOUT", 2*time.Minute); err != nil {
+		return c, err
+	}
+	if c.DeliveryRetry, err = durationVal("PROXY_DELIVERY_RETRY", time.Second); err != nil {
+		return c, err
+	}
+	if c.DispatchLease, err = durationVal("PROXY_DISPATCH_LEASE", 3*time.Minute); err != nil {
 		return c, err
 	}
 	if c.ShutdownTimeout, err = durationVal("PROXY_SHUTDOWN_TIMEOUT", 30*time.Second); err != nil {
@@ -85,37 +100,66 @@ func Load() (Config, error) {
 	if c.Retention, err = durationVal("PROXY_RETENTION", 30*24*time.Hour); err != nil {
 		return c, err
 	}
+	if c.UnknownRetention, err = durationVal("PROXY_UNKNOWN_RETENTION", 0); err != nil {
+		return c, err
+	}
+	if c.CleanupInterval, err = durationVal("PROXY_CLEANUP_INTERVAL", time.Hour); err != nil {
+		return c, err
+	}
+	if c.WebhookDefaultTimeout, err = durationVal("PROXY_WEBHOOK_RESPONSE_TIMEOUT", 10*time.Second); err != nil {
+		return c, err
+	}
 	if c.DatabaseURL == "" {
 		return c, errors.New("PROXY_DATABASE_URL is required")
 	}
-	if c.Workers < 1 || c.OutboxWorkers < 1 || c.DBMaxConns < 4 || c.StreamReplicas < 1 || c.StreamReplicas > 5 {
+	if c.ProxyID == "" || strings.ContainsAny(c.ProxyID, ".*> ") {
+		return c, errors.New("PROXY_ID must be a single NATS token")
+	}
+	if c.Workers < 1 || c.DeliveryWorkers < 1 || c.DBMaxConns < 4 || c.DefaultHostLimit.RPS < 1 || c.DefaultHostLimit.Concurrency < 1 {
 		return c, errors.New("invalid sizing configuration")
 	}
-	if c.RequireSignature && (c.SigningPrivateKeyFile == "" || len(c.VerifyPublicKeys) == 0 || len(c.KeyPermissions) == 0) {
-		return c, errors.New("signing private key and verification public keys are required")
+	if c.MaxRequestTimeout < c.RequestTimeout || c.DispatchLease <= c.MaxRequestTimeout {
+		return c, errors.New("dispatch lease must exceed max request timeout")
 	}
-	if (c.WebhookProvider == "") != (c.WebhookSecret == "") {
-		return c, errors.New("webhook provider and secret must be configured together")
+	publicURL, parseErr := url.Parse(c.PublicBaseURL)
+	if parseErr != nil || publicURL.Host == "" || (publicURL.Scheme != "http" && publicURL.Scheme != "https") {
+		if parseErr == nil {
+			parseErr = errors.New("absolute HTTP/HTTPS URL is required")
+		}
+		err = parseErr
+		return c, fmt.Errorf("PROXY_PUBLIC_BASE_URL: %w", err)
 	}
-	if c.WebhookProvider != "" && len(c.WebhookEventTypes) == 0 {
-		return c, errors.New("PROXY_WEBHOOK_EVENT_TYPES is required with webhook provider")
+	if c.RequireSignature && (c.SigningPrivateKeyFile == "" || len(c.ClientPublicKeys) == 0 || len(c.AllowedClients) == 0) {
+		return c, errors.New("signing key, client public keys and allowed clients are required")
+	}
+	for clientID := range c.AllowedClients {
+		if clientID == "" || strings.ContainsAny(clientID, ".*> ") {
+			return c, fmt.Errorf("invalid client ID %q", clientID)
+		}
+		if c.RequireSignature {
+			if _, ok := c.ClientPublicKeys[clientID]; !ok {
+				return c, fmt.Errorf("allowed client %q has no public key", clientID)
+			}
+		}
+	}
+	needed := max(c.MaxRequestBytes, c.MaxResponseBytes)*4/3 + 64<<10
+	if c.MaxMessageBytes < needed {
+		return c, fmt.Errorf("PROXY_MAX_MESSAGE_BYTES must be at least %d for base64 payloads", needed)
 	}
 	if (c.NATSClientCert == "") != (c.NATSClientKey == "") {
 		return c, errors.New("NATS client certificate and key must be configured together")
 	}
 	return c, nil
 }
-func permissions(v string) map[string][]string {
-	out := map[string][]string{}
-	for _, entry := range strings.Split(v, ";") {
-		parts := strings.SplitN(strings.TrimSpace(entry), "=", 2)
-		if len(parts) == 2 && parts[0] != "" {
-			out[parts[0]] = strings.Split(parts[1], "|")
-		}
+
+func (c Config) LimitForHost(host string) HostLimit {
+	if v, ok := c.HostLimits[strings.ToLower(host)]; ok {
+		return v
 	}
-	return out
+	return c.DefaultHostLimit
 }
-func stringMap(v string) map[string]string {
+
+func clientKeys(v string) map[string]string {
 	out := map[string]string{}
 	for _, entry := range strings.Split(v, ";") {
 		p := strings.SplitN(strings.TrimSpace(entry), "=", 2)
@@ -124,6 +168,39 @@ func stringMap(v string) map[string]string {
 		}
 	}
 	return out
+}
+func set(v string) map[string]bool {
+	out := map[string]bool{}
+	for _, x := range strings.Split(v, ",") {
+		if x = strings.TrimSpace(x); x != "" {
+			out[x] = true
+		}
+	}
+	return out
+}
+func hostLimits(v string) (map[string]HostLimit, error) {
+	out := map[string]HostLimit{}
+	for _, entry := range strings.Split(v, ";") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		p := strings.SplitN(entry, "=", 2)
+		if len(p) != 2 {
+			return nil, fmt.Errorf("invalid host limit %q", entry)
+		}
+		n := strings.Split(p[1], ":")
+		if len(n) != 2 {
+			return nil, fmt.Errorf("invalid host limit %q", entry)
+		}
+		rps, e1 := strconv.Atoi(n[0])
+		concurrency, e2 := strconv.Atoi(n[1])
+		if e1 != nil || e2 != nil || rps < 1 || concurrency < 1 {
+			return nil, fmt.Errorf("invalid host limit %q", entry)
+		}
+		out[strings.ToLower(p[0])] = HostLimit{RPS: rps, Concurrency: concurrency}
+	}
+	return out, nil
 }
 func env(k, d string) string {
 	if v := os.Getenv(k); v != "" {
@@ -158,29 +235,20 @@ func boolVal(k string, d bool) (bool, error) {
 	if v == "" {
 		return d, nil
 	}
-	b, e := strconv.ParseBool(v)
+	n, e := strconv.ParseBool(v)
 	if e != nil {
 		return false, fmt.Errorf("%s: %w", k, e)
 	}
-	return b, nil
+	return n, nil
 }
 func durationVal(k string, d time.Duration) (time.Duration, error) {
 	v := os.Getenv(k)
 	if v == "" {
 		return d, nil
 	}
-	x, e := time.ParseDuration(v)
+	n, e := time.ParseDuration(v)
 	if e != nil {
 		return 0, fmt.Errorf("%s: %w", k, e)
 	}
-	return x, nil
-}
-func csv(v string) []string {
-	var o []string
-	for _, s := range strings.Split(v, ",") {
-		if s = strings.TrimSpace(s); s != "" {
-			o = append(o, s)
-		}
-	}
-	return o
+	return n, nil
 }

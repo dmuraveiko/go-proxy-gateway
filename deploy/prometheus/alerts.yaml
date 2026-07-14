@@ -1,14 +1,19 @@
 groups:
-  - name: integration-gateway
+  - name: http-nats-proxy
     rules:
-      - alert: ProxyOldestPendingTooOld
-        expr: proxy_oldest_pending_seconds > 300
-        for: 5m
-        labels: {severity: critical}
-      - alert: ProxyOutboxBacklog
-        expr: proxy_outbox_pending > 1000
+      - alert: ProxyReadyBacklog
+        expr: proxy_requests{status="ready"} > 1000
         for: 10m
         labels: {severity: warning}
-      - alert: ProxyFailedOperations
-        expr: increase(proxy_operations{status="failed"}[5m]) > 0
+      - alert: ProxyPendingDeliveries
+        expr: proxy_deliveries_pending > 1000
+        for: 10m
+        labels: {severity: warning}
+      - alert: ProxyUnknownOutcome
+        expr: proxy_requests{status="unknown"} > 0
+        for: 1m
+        labels: {severity: critical}
+      - alert: ProxyDispatchingStuck
+        expr: proxy_requests{status="dispatching"} > 0
+        for: 5m
         labels: {severity: warning}

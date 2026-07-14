@@ -1,22 +1,22 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: integration-gateway
+  name: http-nats-proxy
 spec:
   replicas: 3
   selector:
-    matchLabels: {app: integration-gateway}
+    matchLabels: {app: http-nats-proxy}
   template:
     metadata:
-      labels: {app: integration-gateway}
+      labels: {app: http-nats-proxy}
     spec:
       terminationGracePeriodSeconds: 45
       securityContext:
         runAsNonRoot: true
         seccompProfile: {type: RuntimeDefault}
       containers:
-        - name: gateway
-          image: registry.example.com/integration-gateway@sha256:REPLACE_ME
+        - name: proxy
+          image: registry.example.com/http-nats-proxy@sha256:REPLACE_ME
           ports:
             - {name: http, containerPort: 8080}
           envFrom:
@@ -39,8 +39,8 @@ spec:
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
-  name: integration-gateway
+  name: http-nats-proxy
 spec:
   minAvailable: 2
   selector:
-    matchLabels: {app: integration-gateway}
+    matchLabels: {app: http-nats-proxy}

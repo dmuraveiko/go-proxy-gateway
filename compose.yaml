@@ -15,9 +15,18 @@ services:
 
   nats:
     image: nats:2.11-alpine
-    command: ["--jetstream", "--store_dir=/data"]
+    command: ["-c", "/etc/nats/nats.conf"]
     volumes:
-      - nats-data:/data
+      - ./deploy/nats/nats.conf:/etc/nats/nats.conf:ro
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8222/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+  echo:
+    image: hashicorp/http-echo:1.0
+    command: ["-listen=:5678", "-text=proxy-smoke-ok"]
 
   migrate:
     build: .
@@ -28,6 +37,7 @@ services:
     environment:
       PROXY_DATABASE_URL: postgres://proxy:proxy@postgres:5432/proxy?sslmode=disable
       PROXY_REQUIRE_SIGNATURE: "false"
+      PROXY_ALLOWED_CLIENTS: dev-client
 
   proxy:
     build: .
@@ -35,17 +45,19 @@ services:
       migrate:
         condition: service_completed_successfully
       nats:
+        condition: service_healthy
+      echo:
         condition: service_started
     environment:
       PROXY_DATABASE_URL: postgres://proxy:proxy@postgres:5432/proxy?sslmode=disable
       PROXY_NATS_URL: nats://nats:4222
       PROXY_REQUIRE_SIGNATURE: "false"
-      PROXY_STREAM_REPLICAS: "1"
-      PROXY_STREAM_MAX_BYTES: "536870912"
+      PROXY_ALLOWED_CLIENTS: dev-client
+      PROXY_ID: proxy-main
+      PROXY_PUBLIC_BASE_URL: http://localhost:8080
       PROXY_WORKERS: "8"
     ports:
       - "8080:8080"
 
 volumes:
   postgres-data:
-  nats-data:

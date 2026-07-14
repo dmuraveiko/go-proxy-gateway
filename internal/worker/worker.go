@@ -2,38 +2,43 @@ package worker
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"math/rand/v2"
+	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"proxy-server/internal/config"
 	"proxy-server/internal/contracts"
-	"proxy-server/internal/integration"
+	"proxy-server/internal/httpx"
 	"proxy-server/internal/repository"
 )
 
+type Publisher interface {
+	PublishHTTPResult(context.Context, string, contracts.HTTPResult) error
+}
 type Pool struct {
-	repo         *repository.Repository
-	registry     *integration.Registry
-	log          *slog.Logger
-	count        int
-	resultPrefix string
-	dlqPrefix    string
-	lease        time.Duration
+	repo      *repository.Repository
+	executor  *httpx.Executor
+	publisher Publisher
+	cfg       config.Config
+	log       *slog.Logger
 }
 
-func New(repo *repository.Repository, registry *integration.Registry, log *slog.Logger, count int, resultPrefix, dlqPrefix string, lease time.Duration) *Pool {
-	return &Pool{repo: repo, registry: registry, log: log, count: count, resultPrefix: resultPrefix, dlqPrefix: dlqPrefix, lease: lease}
+func New(repo *repository.Repository, executor *httpx.Executor, publisher Publisher, cfg config.Config, log *slog.Logger) *Pool {
+	return &Pool{repo: repo, executor: executor, publisher: publisher, cfg: cfg, log: log}
 }
 func (p *Pool) Run(ctx context.Context) error {
-	errch := make(chan error, p.count)
-	for range p.count {
-		go func() { errch <- p.run(ctx) }()
+	ch := make(chan error, p.cfg.Workers)
+	for range p.cfg.Workers {
+		go func() { ch <- p.run(ctx) }()
 	}
-	for range p.count {
-		if err := <-errch; err != nil && ctx.Err() == nil {
+	for range p.cfg.Workers {
+		if err := <-ch; err != nil && ctx.Err() == nil {
 			return err
 		}
 	}
@@ -44,71 +49,134 @@ func (p *Pool) run(ctx context.Context) error {
 		if ctx.Err() != nil {
 			return nil
 		}
-		op, err := p.repo.ClaimOperation(ctx, p.lease)
+		op, err := p.repo.ReserveRequest(ctx, p.cfg.DispatchLease)
 		if errors.Is(err, pgx.ErrNoRows) {
-			time.Sleep(100 * time.Millisecond)
+			if !wait(ctx, 100*time.Millisecond) {
+				return nil
+			}
 			continue
 		}
 		if err != nil {
-			return err
+			if !wait(ctx, time.Second) {
+				return nil
+			}
+			continue
 		}
-		p.execute(ctx, op)
+		if err = p.execute(ctx, op); err != nil && ctx.Err() == nil {
+			p.log.Error("execute operation", "request_id", op.Request.RequestID, "error", err)
+		}
 	}
 }
-func (p *Pool) execute(ctx context.Context, op repository.Operation) {
-	h, err := p.registry.Command(op.Command.Type, op.Command.Version)
-	if err == nil {
-		err = h.Validate(op.Command.Payload)
+func (p *Pool) execute(ctx context.Context, op repository.Operation) error {
+	host := strings.ToLower(mustHost(op.Request.URL))
+	limit := p.cfg.LimitForHost(host)
+	permit, err := p.repo.AcquireHostPermit(ctx, host, limit.RPS, limit.Concurrency, p.cfg.MaxRequestTimeout+time.Minute)
+	if errors.Is(err, repository.ErrNoPermit) {
+		_ = p.repo.ReleaseReserved(ctx, op.Request.RequestID, op.DispatchToken)
+		wait(ctx, 50*time.Millisecond)
+		return nil
 	}
-	var payload json.RawMessage
-	if err == nil {
-		payload, err = h.Execute(ctx, op.Command.Payload)
+	if err != nil {
+		_ = p.repo.ReleaseReserved(ctx, op.Request.RequestID, op.DispatchToken)
+		return err
 	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) && ctx.Err() != nil {
-		if e := p.repo.Release(context.WithoutCancel(ctx), op.Command.ID); e != nil {
-			p.log.Error("release canceled operation", "error", e)
+	defer func() { _ = p.repo.ReleaseHostPermit(context.WithoutCancel(ctx), permit) }()
+	if err = p.repo.BeginDispatch(ctx, op.Request.RequestID, op.DispatchToken, p.cfg.DispatchLease); err != nil {
+		return err
+	}
+	timeout := op.Request.Timeout
+	if timeout <= 0 {
+		timeout = p.cfg.RequestTimeout
+	}
+	if timeout > p.cfg.MaxRequestTimeout {
+		timeout = p.cfg.MaxRequestTimeout
+	}
+	callCtx, cancel := context.WithTimeout(ctx, timeout)
+	result, callErr := p.executor.Do(callCtx, op.Request)
+	cancel()
+	attempt := op.Attempts + 1
+	if callErr != nil {
+		if p.canRetry(op.Request, attempt, true, 0) {
+			return p.repo.ScheduleRetry(ctx, op.Request.RequestID, op.DispatchToken, callErr.Error(), time.Now().Add(backoff(op.Request.Retry, attempt)))
 		}
-		return
+		result = contracts.HTTPResult{State: "unknown", ErrorCode: "http_outcome_unknown", Error: callErr.Error()}
+	} else if p.canRetry(op.Request, attempt, false, result.StatusCode) {
+		return p.repo.ScheduleRetry(ctx, op.Request.RequestID, op.DispatchToken, fmt.Sprintf("HTTP %d", result.StatusCode), time.Now().Add(backoff(op.Request.Retry, attempt)))
+	} else {
+		result.State = "http_completed"
 	}
-	result := contracts.Result{CommandID: op.Command.ID, CorrelationID: op.Command.CorrelationID, Type: op.Command.Type + ".result", Payload: payload, Attempts: op.Attempts, FinishedAt: time.Now().UTC()}
-	subject := p.resultPrefix + "." + op.Command.Type
-	if err == nil {
-		result.Status = "succeeded"
-		if e := p.repo.Complete(ctx, result, subject); e != nil {
-			p.log.Error("complete operation", "error", e)
+	result.ResultID = "result_" + op.Request.RequestID
+	result.RequestID = op.Request.RequestID
+	result.ProxyID = p.cfg.ProxyID
+	result.Attempts = attempt
+	result.CompletedAt = time.Now().UTC()
+	// The agreed exceptional ordering: first give the client a chance to persist the
+	// response, then persist it locally. HTTP is never re-executed because this write fails.
+	directCtx, cancelDirect := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+	_ = p.publisher.PublishHTTPResult(directCtx, op.Request.ClientID, result)
+	cancelDirect()
+	for {
+		saveCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		err = p.repo.SaveHTTPResult(saveCtx, op.DispatchToken, op.Request.ClientID, "client."+op.Request.ClientID+".proxy."+p.cfg.ProxyID+".results", result)
+		cancel()
+		if err == nil {
+			return nil
 		}
-		return
-	}
-	policy := integration.RetryPolicy{MaxAttempts: 1}
-	if h != nil {
-		policy = h.RetryPolicy()
-	}
-	code, retryable := "execution_failed", false
-	var executionErr *integration.ExecutionError
-	if errors.As(err, &executionErr) {
-		code = executionErr.Code
-		retryable = executionErr.Retryable
-	}
-	if retryable && op.Attempts < policy.MaxAttempts {
-		delay := backoff(policy, op.Attempts)
-		if e := p.repo.Retry(ctx, op.Command.ID, code, err.Error(), time.Now().Add(delay)); e != nil {
-			p.log.Error("schedule retry", "error", e)
+		p.log.Error("persist HTTP result; request will not be re-sent", "request_id", op.Request.RequestID, "error", err)
+		if !wait(ctx, time.Second) {
+			return nil
 		}
-		return
-	}
-	result.Status = "failed"
-	result.Error = &contracts.Problem{Code: code, Message: err.Error(), Retryable: false}
-	if e := p.repo.Fail(ctx, result, subject, p.dlqPrefix+"."+op.Command.Type); e != nil {
-		p.log.Error("fail operation", "error", e)
 	}
 }
-func backoff(p integration.RetryPolicy, attempt int) time.Duration {
-	d := p.InitialBackoff << min(attempt-1, 20)
-	if d > p.MaxBackoff {
-		d = p.MaxBackoff
+func (p *Pool) canRetry(req contracts.HTTPRequest, attempt int, network bool, status int) bool {
+	max := req.Retry.MaxAttempts
+	if max <= 0 {
+		max = 1
 	}
+	if attempt >= max {
+		return false
+	}
+	safe := req.Method == http.MethodGet || req.Method == http.MethodHead || req.Method == http.MethodOptions || req.Retry.Idempotent
+	if !safe {
+		return false
+	}
+	if network {
+		return req.Retry.RetryNetworkFail
+	}
+	for _, s := range req.Retry.RetryStatuses {
+		if s == status {
+			return true
+		}
+	}
+	return false
+}
+func backoff(policy contracts.RetryPolicy, attempt int) time.Duration {
+	d := policy.InitialBackoff
 	if d <= 0 {
 		d = time.Second
 	}
+	for i := 1; i < attempt && i < 20; i++ {
+		d *= 2
+	}
+	if policy.MaxBackoff > 0 && d > policy.MaxBackoff {
+		d = policy.MaxBackoff
+	}
 	return d + time.Duration(rand.Int64N(int64(d/2)+1))
+}
+func mustHost(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	return u.Host
+}
+func wait(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
 }

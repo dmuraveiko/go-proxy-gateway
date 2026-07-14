@@ -1,7 +1,7 @@
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: integration-gateway
+  name: http-nats-proxy
 spec:
   podSelector:
     matchLabels: {app: integration-gateway}
@@ -22,4 +22,7 @@ spec:
       ports:
         - {protocol: UDP, port: 53}
         - {protocol: TCP, port: 53}
-# Add explicit provider IP/CIDR egress rules per environment; deny-all remains the default.
+    # Business requirement allows arbitrary HTTP/HTTPS destinations and ports.
+    # Kubernetes NetworkPolicy cannot verify L7 HTTP; client ACL is the trust boundary.
+    - to:
+        - ipBlock: {cidr: 0.0.0.0/0}

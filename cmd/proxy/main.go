@@ -6,16 +6,13 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
-	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/nats-io/nats.go"
 	"proxy-server/internal/app"
 	"proxy-server/internal/config"
-	"proxy-server/internal/integration"
-	"proxy-server/internal/integrations/genericwebhook"
-	"proxy-server/internal/integrations/jsonapi"
+	"proxy-server/internal/httpx"
 	"proxy-server/internal/message"
 	"proxy-server/internal/repository"
 	"proxy-server/internal/transport"
@@ -25,7 +22,7 @@ import (
 func main() {
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	if err := run(log); err != nil {
-		log.Error("service stopped", "error", err)
+		log.Error("proxy stopped", "error", err)
 		os.Exit(1)
 	}
 }
@@ -38,16 +35,9 @@ func run(log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	verifiers, err := message.ParsePublicKeys(cfg.VerifyPublicKeys)
+	clientKeys, clientByKeyID, err := message.ParseClientPublicKeys(cfg.ClientPublicKeys)
 	if err != nil {
 		return err
-	}
-	if cfg.RequireSignature {
-		for _, key := range verifiers {
-			if len(cfg.KeyPermissions[message.PublicKeyID(key)]) == 0 {
-				return errors.New("every verification key must have command permissions")
-			}
-		}
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -67,7 +57,7 @@ func run(log *slog.Logger) error {
 	if _, err = repo.Stats(ctx); err != nil {
 		return errors.New("database is not migrated; run `proxy migrate`")
 	}
-	opts := []nats.Option{nats.Name("integration-gateway"), nats.Timeout(5 * time.Second), nats.MaxReconnects(-1), nats.ReconnectWait(time.Second)}
+	opts := []nats.Option{nats.Name("http-nats-proxy:" + cfg.ProxyID + ":" + cfg.InstanceID), nats.Timeout(5 * time.Second), nats.MaxReconnects(-1), nats.ReconnectWait(time.Second)}
 	if cfg.NATSCredsFile != "" {
 		opts = append(opts, nats.UserCredentials(cfg.NATSCredsFile))
 	}
@@ -81,63 +71,67 @@ func run(log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	defer nc.Drain()
-	js, err := nc.JetStream(nats.PublishAsyncMaxPending(4096))
-	if err != nil {
-		return err
-	}
-	registry := integration.NewRegistry()
-	if cfg.TransactionEndpoint != "" {
-		handler, handlerErr := jsonapi.NewTransactionStatus(cfg.TransactionEndpoint, cfg.ProviderAPIKeyHeader, cfg.ProviderAPIKey, cfg.RequestTimeout, cfg.ProviderRPS, func(ctx context.Context) error {
-			return repo.AcquireRateToken(ctx, "transaction-status", cfg.ProviderRPS)
-		})
-		if handlerErr != nil {
-			return handlerErr
-		}
-		if err = registry.RegisterCommand(handler); err != nil {
-			return err
-		}
-	}
-	if cfg.WebhookProvider != "" {
-		if err = registry.RegisterWebhook(genericwebhook.New(cfg.WebhookProvider, cfg.WebhookSecret, cfg.WebhookEventTypes)); err != nil {
-			return err
-		}
-	}
-	streamCfg := transport.Config{
-		Commands: transport.StreamSpec{Name: cfg.CommandsStream, Subject: cfg.CommandSubject, MaxAge: 7 * 24 * time.Hour, MaxBytes: cfg.StreamMaxBytes, MaxMsgSize: cfg.MaxMessageBytes, Discard: nats.DiscardNew},
-		Results:  transport.StreamSpec{Name: cfg.ResultsStream, Subject: cfg.ResultPrefix + ".>", MaxAge: 30 * 24 * time.Hour, MaxBytes: cfg.StreamMaxBytes, MaxMsgSize: cfg.MaxMessageBytes, Discard: nats.DiscardNew},
-		Events:   transport.StreamSpec{Name: cfg.EventsStream, Subject: cfg.EventPrefix + ".>", MaxAge: 30 * 24 * time.Hour, MaxBytes: cfg.StreamMaxBytes, MaxMsgSize: cfg.MaxMessageBytes, Discard: nats.DiscardNew},
-		DLQ:      transport.StreamSpec{Name: cfg.DLQStream, Subject: cfg.DLQPrefix + ".>", MaxAge: 90 * 24 * time.Hour, MaxBytes: cfg.StreamMaxBytes, MaxMsgSize: cfg.MaxMessageBytes, Discard: nats.DiscardNew},
-		Durable:  cfg.CommandDurable, Replicas: cfg.StreamReplicas, AckWait: cfg.AckWait, MaxAckPending: cfg.MaxAckPending, FetchBatch: cfg.FetchBatch,
-	}
-	var natsReady atomic.Bool
-	transportLayer := transport.New(js, repo, log, streamCfg, signer, verifiers, cfg.KeyPermissions, cfg.RequireSignature, natsReady.Store)
-	if err = transportLayer.Ensure(ctx); err != nil {
-		return err
-	}
-	workers := worker.New(repo, registry, log, cfg.Workers, cfg.ResultPrefix, cfg.DLQPrefix, cfg.RequestTimeout+time.Minute)
-	httpApp := app.New(log, repo, registry, cfg.EventPrefix, natsReady.Load)
-	serviceCount := 3 + cfg.OutboxWorkers
-	errch := make(chan error, serviceCount)
-	go func() { errch <- transportLayer.Consume(ctx) }()
-	for range cfg.OutboxWorkers {
-		go func() { errch <- transportLayer.PublishOutbox(ctx) }()
-	}
+	defer nc.Close()
+	core := transport.New(nc, repo, log, transport.Config{ProxyID: cfg.ProxyID, InstanceID: cfg.InstanceID, PublicBaseURL: cfg.PublicBaseURL, DeliveryWorkers: cfg.DeliveryWorkers, DeliveryRetry: cfg.DeliveryRetry, MaxMessageBytes: cfg.MaxMessageBytes, MaxRequestBytes: cfg.MaxRequestBytes, RequireSignature: cfg.RequireSignature}, signer, clientKeys, clientByKeyID, cfg.AllowedClients)
+	executor := httpx.New(cfg.MaxResponseBytes, 256, 32, 90*time.Second)
+	defer executor.CloseIdleConnections()
+	workers := worker.New(repo, executor, core, cfg, log)
+	httpApp := app.New(log, repo, core, cfg.HTTPAddr, cfg.WebhookDefaultMaxBody)
+	errch := make(chan error, 3)
+	go func() { errch <- core.Run(ctx) }()
 	go func() { errch <- workers.Run(ctx) }()
-	go func() { errch <- httpApp.Run(ctx, cfg.HTTPAddr) }()
-	go maintenance(ctx, repo, log, cfg.Retention)
+	go func() { errch <- httpApp.Run(ctx) }()
+	go maintenance(ctx, repo, log, cfg)
 	select {
 	case <-ctx.Done():
-		return drainServices(errch, serviceCount, cfg.ShutdownTimeout, nil)
+		return drain(errch, 3, cfg.ShutdownTimeout, nil)
 	case err = <-errch:
 		stop()
 		if errors.Is(err, context.Canceled) {
 			err = nil
 		}
-		return drainServices(errch, serviceCount-1, cfg.ShutdownTimeout, err)
+		return drain(errch, 2, cfg.ShutdownTimeout, err)
 	}
 }
-func drainServices(ch <-chan error, count int, timeout time.Duration, first error) error {
+func maintenance(ctx context.Context, repo *repository.Repository, log *slog.Logger, cfg config.Config) {
+	recoveryTicker := time.NewTicker(5 * time.Second)
+	cleanupTicker := time.NewTicker(cfg.CleanupInterval)
+	defer recoveryTicker.Stop()
+	defer cleanupTicker.Stop()
+	recoverExpired := func() {
+		if n, err := repo.RecoverExpiredDispatches(ctx); err != nil {
+			log.Error("recover expired dispatches", "error", err)
+		} else if n > 0 {
+			log.Warn("expired dispatches recovered", "count", n)
+		}
+	}
+	cleanup := func() {
+		before := time.Now().Add(-cfg.Retention)
+		var unknown *time.Time
+		if cfg.UnknownRetention > 0 {
+			v := time.Now().Add(-cfg.UnknownRetention)
+			unknown = &v
+		}
+		if n, err := repo.Cleanup(ctx, before, unknown, 1000); err != nil {
+			log.Error("retention cleanup", "error", err)
+		} else if n > 0 {
+			log.Info("retention cleanup", "deleted", n)
+		}
+	}
+	recoverExpired()
+	cleanup()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-recoveryTicker.C:
+			recoverExpired()
+		case <-cleanupTicker.C:
+			cleanup()
+		}
+	}
+}
+func drain(ch <-chan error, count int, timeout time.Duration, first error) error {
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	for range count {
@@ -154,21 +148,4 @@ func drainServices(ch <-chan error, count int, timeout time.Duration, first erro
 		}
 	}
 	return first
-}
-func maintenance(ctx context.Context, repo *repository.Repository, log *slog.Logger, retention time.Duration) {
-	ticker := time.NewTicker(24 * time.Hour)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			n, err := repo.Cleanup(ctx, time.Now().Add(-retention))
-			if err != nil {
-				log.Error("retention cleanup", "error", err)
-			} else {
-				log.Info("retention cleanup", "deleted_operations", n)
-			}
-		}
-	}
 }

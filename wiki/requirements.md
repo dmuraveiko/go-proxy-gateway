@@ -1,11 +1,90 @@
-# Proxy requirements
+# Требования к HTTP–NATS Proxy
 
-## Confirmed direction
+## Статус
 
-The service bridges HTTP and NATS asynchronously, calls only approved Internet resources, accepts only approved webhook routes, retries transient failures, confirms acceptance/results, survives restarts, and remains extensible for provider-specific authentication, rate limits, and health probes. NATS messages are expected to use ed25519 signatures.
+Здесь зафиксировано направление, согласованное 13 июля 2026 года и реализованное в
+текущем коде. Нерешенные production-параметры перечислены в
+[open questions](open-questions.md).
 
-## Tensions in the source
+## Назначение
 
-The source says Core NATS without JetStream and no database, while the newer request requires failure-safe delivery. Core NATS is at-most-once and an in-memory service cannot preserve work across crashes. The initial implementation therefore uses a local durable bbolt inbox. This is local service state rather than a shared business database, but it changes the original stateless deployment assumption.
+Proxy дает внутренним сервисам без прямого доступа в интернет возможность выполнять
+HTTP-запросы через NATS. Proxy является инфраструктурным транспортом и не знает
+прикладного назначения запроса, его схемы или конкретного внешнего provider-а.
 
-Blockchain consensus across two API providers belongs above the generic transport layer: the proxy reports independent provider results; a domain service decides whether they agree.
+Второе направление — прием внешних webhook и надежная доставка их содержимого одному
+или нескольким внутренним сервисам через NATS.
+
+## Подтвержденные требования
+
+- Используется Core NATS, без JetStream.
+- Внутренние операции асинхронны: acceptance ACK подтверждает только надежный прием
+  команды, а итоговый HTTP-результат приходит отдельным сообщением позднее.
+- PostgreSQL хранит очередь, состояния операций, попытки, дедупликацию, результаты,
+  webhook и исходящие сообщения.
+- Авторизованный внутренний сервис может обратиться к любому внешнему HTTP/HTTPS URL.
+  Proxy не содержит whitelist доменов, IP-адресов, endpoint или provider-ов.
+- Право пользоваться Proxy определяется идентичностью внутреннего сервиса. Сообщения
+  подписываются Ed25519; публичные ключи и разрешения сервисов задаются конфигурацией.
+- HTTP выполняется стандартным `net/http`.
+- Proxy не изменяет прикладные данные: method, URL, query, значения end-to-end headers,
+  request body, response status, значения response headers и response body.
+- Допустимы технические изменения wire-представления, которые выполняет `net/http`:
+  порядок и регистр заголовков, framing, `Content-Length`/chunked encoding и управление
+  соединением. Побайтовая идентичность HTTP-пакета на проводе не обещается.
+- Автоматические redirect и прозрачная декомпрессия отключены. Тело передается как
+  непрозрачный массив байтов и не декодируется Proxy.
+- Прием команды подтверждается только после ее надежной фиксации в PostgreSQL.
+- Результат считается доставленным только после прикладного ACK от сервиса-получателя.
+- Все повторные публикации используют стабильный `request_id`; обработка и доставка
+  поддерживают дедупликацию.
+- Семантика — at-least-once. Exactly-once для внешнего HTTP side effect не обещается.
+- По умолчанию HTTP-запрос выполняется один раз. Повторы включаются вызывающим сервисом
+  явно, потому что повтор `POST`, платежа или другой write-операции может создать дубль.
+- Proxy переживает рестарт и временную недоступность NATS, PostgreSQL, интернета или
+  получателя результата без потери уже подтвержденной работы.
+- Один webhook route может иметь несколько подписчиков. Для каждого подписчика
+  создается независимая durable-доставка со своим состоянием и ACK.
+- Синхронными остаются только короткие границы протокола: ожидание acceptance ACK
+  внутренним producer-ом и HTTP-ответ внешнему отправителю webhook после DB commit.
+- Готовый Go-клиент предоставляет синхронный `Do`: одна goroutine ждет конечный
+  HTTP-результат, а параллельность caller включает явно через другие goroutine.
+- Proxy не контролирует порядок запросов одного клиента и не использует порядок ACK
+  или NATS delivery как бизнес-порядок.
+- После HTTP-ответа Proxy сначала пытается передать результат клиенту, а затем пишет
+  его в свою БД. Ошибка этой записи не вызывает повторный HTTP-запрос.
+- Нагрузка ограничивается общими для всех реплик RPS/concurrency limits по target host.
+- Текущая реализация использует фиксированное секундное окно и не обещает строгий
+  `min_interval` между запросами.
+- Завершенные записи очищаются по retention; активные, недоставленные и `unknown` без
+  явно настроенного TTL не удаляются.
+- Внешний webhook endpoint сейчас принимает `POST`; control API поддерживает register,
+  subscribe и delete.
+- Register result пока не имеет полного durable ACK-handshake; subscribe/delete не
+  возвращают отдельный success ACK. Это явно зафиксированная production-доработка.
+
+## Граница неизменности HTTP
+
+Под «Proxy не модифицирует запрос и ответ» понимается неизменность прикладной
+семантики и payload, а не байтов TCP-потока. Например, два одинаковых значения одного
+заголовка должны сохраниться, но их положение на проводе может измениться.
+
+Если конкретная интеграция подписывает точное wire-представление HTTP вместе с
+порядком и регистром заголовков, она не укладывается в этот контракт и потребует
+отдельного raw transport. Подпись body, URL и определенных значений заголовков
+поддерживается обычным контрактом.
+
+## Не является задачей Proxy
+
+- проверка бизнес-схем request/response body;
+- выбор внешнего provider-а за вызывающий сервис;
+- добавление API key, `Authorization` или иных прикладных заголовков;
+- интерпретация ответа внешнего API;
+- гарантия exactly-once выполнения внешней операции;
+- ограничение набора внешних ресурсов, доступных авторизованному сервису.
+
+## Операционные ограничения
+
+Лимиты размера request/response, timeout, concurrency и rate limit нужны для защиты
+самого Proxy. Они не являются whitelist внешних ресурсов и должны быть явно описаны в
+контракте, чтобы отказ был предсказуемым.

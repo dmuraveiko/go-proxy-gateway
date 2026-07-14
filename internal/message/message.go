@@ -108,6 +108,24 @@ func ParsePublicKeys(values []string) ([]ed25519.PublicKey, error) {
 	}
 	return out, nil
 }
+func ParseClientPublicKeys(values map[string]string) (map[string]ed25519.PublicKey, map[string]string, error) {
+	byClient := make(map[string]ed25519.PublicKey, len(values))
+	clientByKeyID := make(map[string]string, len(values))
+	for clientID, value := range values {
+		b, err := base64.RawStdEncoding.DecodeString(strings.TrimSpace(value))
+		if err != nil || len(b) != ed25519.PublicKeySize {
+			return nil, nil, fmt.Errorf("invalid public key for client %q", clientID)
+		}
+		key := ed25519.PublicKey(b)
+		keyID := PublicKeyID(key)
+		if previous := clientByKeyID[keyID]; previous != "" {
+			return nil, nil, fmt.Errorf("clients %q and %q use the same key", previous, clientID)
+		}
+		byClient[clientID] = key
+		clientByKeyID[keyID] = clientID
+	}
+	return byClient, clientByKeyID, nil
+}
 func PublicKeyID(k ed25519.PublicKey) string {
 	if len(k) < 8 {
 		return ""

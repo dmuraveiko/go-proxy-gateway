@@ -1,11 +1,22 @@
 # Production checklist
 
-- NATS: 3 or 5 JetStream nodes on separate SSDs/AZs; TLS, JWT/NKeys, accounts and subject ACLs enabled.
-- PostgreSQL: HA deployment, TLS, PITR backups, tested restore, connection proxy and alerting.
-- Run `proxy migrate` as a one-shot deployment job before rolling out application pods.
-- Configure ed25519 key permissions; private key comes from Vault/KMS/CSI secret provider.
-- Replace generic webhook with provider-specific canonical signature verification and event mapping.
-- Pin container digest, generate SBOM, scan image and dependencies, sign the image.
-- Apply NetworkPolicy with explicit provider CIDRs and configure ingress TLS/rate limits.
-- Load-test at 2× expected peak, then test NATS loss, DB loss, provider timeouts and pod termination.
-- Verify dashboards/alerts, DLQ access control, retention job and operational ownership.
+- Core NATS: cluster, TLS, accounts/NKeys и минимальные publish/subscribe subject ACL.
+- PostgreSQL: HA, TLS, PITR, tested restore, disk/WAL alerts и connection proxy.
+- `000001_initial` применять на чистой БД. Для среды со старой prototype-версией
+  `000001` подготовить и проверить отдельный transition migration/export: одной замены
+  файла недостаточно.
+- Ed25519 private keys выдаются через Vault/KMS/CSI, public keys и client ACL проверены.
+- Подтвердить бизнесом unrestricted destination, включая доступные внутренние адреса.
+- Настроить default и per-host RPS/concurrency на основе реальных provider limits.
+- Для каждого provider решить, допустим ли fixed-window burst; при требовании строгой
+  паузы реализовать и нагрузочно проверить `min_interval` до подключения provider.
+- Настроить retention; `unknown` не удалять автоматически без согласованного TTL.
+- Проверить static/delegated webhook timeout, capability URL и provider retry behavior.
+- Подтвердить, что webhook provider использует `POST`; согласовать нужный объем control
+  API: текущий scope — register, subscribe и delete.
+- Добавить durable control ACK для webhook register/subscribe/delete либо явно принять
+  текущую модель: повтор register с тем же ID, без success ACK для subscribe/delete.
+- Решить, нужен ли отдельный status/cancel management API для HTTP-операций.
+- Load test на 2× peak; отдельно NATS loss, DB/disk-full, HTTP timeout и pod kill во время HTTP.
+- Проверить, что client.Store действительно durable и идемпотентен.
+- Pin digest, SBOM, vulnerability scan, image signature, dashboards и alerts.

@@ -1,11 +1,17 @@
 # Service levels
 
-Initial targets, to be validated by load tests:
+Начальные цели, которые должны быть подтверждены load/chaos tests:
 
-- Availability: 99.95% monthly for accepting durable commands/webhooks.
-- Processing latency: 99% of healthy-provider read commands completed within 10 seconds.
-- Durable acceptance: no acknowledged command or webhook event lost.
-- RPO: 0 for replicated JetStream acknowledgements and committed PostgreSQL transactions.
-- RTO: 30 minutes.
+- доступность durable-приема HTTP commands/static webhook: 99.95% в месяц;
+- p99 acceptance ACK при здоровых NATS/PostgreSQL: до 1 секунды;
+- p99 начала healthy HTTP GET после acceptance handshake и без throttling: до 2 секунд;
+- подтвержденный request/result/webhook не теряется внутри PostgreSQL boundary;
+- RPO PostgreSQL: 0 для синхронно подтвержденных транзакций;
+- RTO: 30 минут;
+- рост `unknown` выше нуля — отдельный operational incident.
 
-Provider downtime is tracked separately from gateway availability. Error-budget burn alerts should cover 1-hour and 6-hour windows.
+Недоступность внешнего HTTP provider, delegated webhook responder и deliberate host
+throttling считаются отдельно от доступности Proxy.
+
+Сценарии, относительно которых проверяются эти цели, описаны в
+[логике системы для согласования](logic-for-tech-director.md).
