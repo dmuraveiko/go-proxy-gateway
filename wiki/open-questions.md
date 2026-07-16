@@ -1,26 +1,18 @@
-# Открытые вопросы перед production
+# Открытые вопросы
 
-Функциональный протокол реализован. До production deployment владельцы системы должны
-согласовать значения и эксплуатационные политики:
+Implementation-детали зафиксированы в [docs/logic.md](../docs/logic.md) и не требуют
+отдельного согласования. Перед рефакторингом нужно подтвердить только три решения:
 
-1. Конкретные client IDs, логические proxy IDs и NATS account/subject ACL.
-2. Процесс выдачи, rotation и emergency revocation Ed25519 keys.
-3. Production limits request/response/webhook body и timeout.
-4. Default и per-host RPS/concurrency для реальных внешних серверов.
-5. Retention завершенных операций и ручной workflow для `unknown`.
-6. PostgreSQL HA/PITR/RPO, NATS cluster topology и SLO после load tests.
-7. Нужен ли отдельный query/cancel management API поверх существующего synchronous
-   Go client и repeated result delivery.
-8. Для каких webhook требуется provider-specific auth до DB commit, а для каких
-   достаточно capability URL и последующей проверки сервисом-получателем.
-9. Нужна ли глобальная квота HTTP connections с одного NAT IP поверх per-host limiter
-   логического Proxy.
-10. Нужен ли отдельным provider-ам строгий `min_interval`, которого не гарантирует
-    текущий fixed-window limiter.
-11. Нужны ли webhook methods кроме `POST`, а также list/get/update/unsubscribe и
-    rotation capability token поверх текущих register/subscribe/delete.
-12. Требуется ли полный durable ACK-handshake для webhook control commands. Сейчас
-    register можно безопасно повторить, но его result best-effort, а subscribe/delete
-    не возвращают success ACK.
-13. Для любой среды со старой prototype-версией `000001` нужен отдельный переходный
-    migration/export. Новая единая `000001_initial` применяется только к чистой БД.
+1. **Один Proxy — одна БД.** Предлагается считать Proxy логическим `proxy_id`: после
+   рестарта он подключается к своей прежней БД, одновременно работает один процесс.
+2. **Durability с двух сторон.** Предлагается оставить PostgreSQL у Proxy и использовать
+   существующую БД клиентского приложения через storage adapter.
+3. **Граница неизменности HTTP.** Предлагается сохранять method, URL, значения headers
+   и body, принимая стандартное поведение `net/http` без гарантии порядка заголовков и
+   точных bytes сетевого пакета.
+
+Варианты и последствия каждого решения подробно описаны в разделе
+[«Вопросы, которые нужно подтвердить»](../docs/logic.md#вопросы-которые-нужно-подтвердить).
+
+Размеры, timeout, backoff, retention, host limits, ключи, NATS ACL и HA-параметры
+являются конфигурацией/эксплуатацией и выбираются без изменения архитектуры.

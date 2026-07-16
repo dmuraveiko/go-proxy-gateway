@@ -35,3 +35,15 @@ Replaced the JetStream/provider-specific gateway with the agreed universal proxy
 ## [2026-07-14] documentation | Review package and squashed schema
 
 Squashed the prototype migration history into one clean-database `000001_initial`, synchronized the README, runbook, SLO, production checklist and wiki with the implemented Core NATS design, and added a plain-language behavior document for technical review with normal and failure scenarios.
+
+## [2026-07-16] review | Per-proxy storage and standard HTTP adapters
+
+Recorded review feedback as a proposed target: one PostgreSQL per unique proxy, client-owned durable storage, the full 15-step ACK exchange, automatic unknown-error delivery, outgoing integration through `http.RoundTripper`, callback integration through `http.Handler`, and explicit separation of outgoing and callback code. Marked the current implementation as a prototype pending agreement and refactoring.
+
+## [2026-07-16] query | Refactoring blockers and failure scenarios
+
+Compared the proposed target with the current prototype and recorded the remaining decisions around proxy/database identity, client persistence, request IDs, cancellation, `net/http` compatibility, proxy failover, retries, callback behavior, NATS retry lifetime and production limits.
+
+## [2026-07-16] decision | Minimized architecture questions
+
+Resolved implementation-level choices locally: request IDs, cancellation after durable acceptance, no automatic proxy failover, explicit HTTP retries, durable callback control, provider deduplication boundary, configurable throttling and automatic retention. Reduced technical-director confirmation to three contract decisions: proxy/database identity, client-side durable storage and application-data versus wire-byte HTTP preservation.

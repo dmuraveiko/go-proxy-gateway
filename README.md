@@ -1,346 +1,220 @@
 # HTTP–NATS Proxy
 
-Production-oriented Go-модуль, который дает внутренним сервисам без прямого доступа
-в интернет возможность выполнять произвольные HTTP/HTTPS-запросы через Core NATS.
-PostgreSQL отвечает за durability, состояния, дедупликацию и повторную доставку.
+Proxy позволяет внутренним сервисам без прямого доступа в интернет выполнять HTTP
+через NATS и принимать внешние callback.
 
-Proxy не знает бизнес-схему запроса, не выбирает provider и не добавляет credentials.
-Авторизованный клиент сам передает URL, method, headers и body.
+Proxy универсальный: клиент сам передаёт адрес, method, headers и body. Proxy не знает
+бизнес-смысл запроса, не добавляет credentials и не ограничивает список внешних
+адресов.
 
-Описание всей логики простыми словами, включая аварийные сценарии и примеры для
-согласования: [документ для технического директора](docs/logic-for-tech-director.md).
+Простое описание всей логики находится в [docs/logic.md](docs/logic.md). Именно этот
+документ является основой для согласования поведения системы.
 
-## Что реализовано
+## Статус
 
-- Core NATS без JetStream;
-- PostgreSQL inbox и durable deliveries;
-- Ed25519-подпись сообщений и ACL `client_id → proxy_id`;
-- стабильный `request_id` и дедупликация повторных команд;
-- двухсторонний acceptance/result ACK-протокол;
-- универсальный HTTP executor на стандартном `net/http`;
-- один долгоживущий connection pool на экземпляр Proxy;
-- общий для всех реплик rate/concurrency limit по целевому host;
-- безопасная retry-policy и состояние `unknown`;
-- синхронный Go-клиент поверх асинхронного NATS-протокола;
-- динамическая регистрация webhook через NATS;
-- статический и delegated webhook response;
-- несколько независимых webhook subscribers;
-- leases, восстановление после рестарта, retention cleanup;
-- health endpoints, Prometheus-метрики, Docker Compose и Kubernetes-манифест.
+Репозиторий содержит рабочий прототип. После последнего архитектурного обсуждения
+зафиксированы изменения, которые ещё нужно внести в код:
 
-## Основной сценарий
+- один Proxy-сервер должен использовать только свою PostgreSQL;
+- разные Proxy не должны совместно использовать одну БД;
+- исходящий клиентский API должен реализовать `http.RoundTripper`;
+- callback API должен принимать обычный `http.Handler`;
+- исходящее и входящее направления нужно разделить по пакетам;
+- `unknown` должен автоматически возвращаться клиенту как ошибка и очищаться после
+  завершения доставки, без ручного workflow;
+- текущую реализацию нужно упростить после финального согласования протокола.
+
+Поэтому текущий код пока не следует считать финальным API или готовым к code review.
+
+## Основные решения
+
+- Core NATS используется как транспорт, без JetStream.
+- PostgreSQL хранит очередь, состояния и недоставленные результаты.
+- Сообщения подписываются Ed25519.
+- Клиент явно выбирает Proxy по `proxy_id`.
+- Повторные сообщения дедуплицируются по стабильному ID.
+- HTTP по умолчанию выполняется один раз.
+- Proxy использует стандартный `net/http`.
+- Содержимое HTTP-запроса и ответа не интерпретируется Proxy.
+
+## Базы данных
+
+Один Proxy-сервер соответствует одной отдельной PostgreSQL:
 
 ```text
-Service A                     Proxy                         Internet
-   │                            │                              │
-   │ сохранить request          │                              │
-   │ publish HTTP command       │                              │
-   ├───────────────────────────►│                              │
-   │                            │ сохранить request в PG       │
-   │◄──────── acceptance ACK ───┤                              │
-   │ сохранить acceptance       │                              │
-   ├──── acceptance ACK ───────►│                              │
-   │                            │ сохранить ACK + dispatching  │
-   │                            ├──────── HTTP request ───────►│
-   │                            │◄────── HTTP response ────────┤
-   │◄──────── result ───────────┤  сначала шанс клиенту        │
-   │ сохранить result           │  затем сохранить result в PG │
-   ├──────── result ACK ───────►│                              │
-   │                            │ сохранить ACK                │
-   │◄──── ACK confirmed ────────┤                              │
-   │ сохранить completion       │                              │
+Proxy A ──► PostgreSQL A
+Proxy B ──► PostgreSQL B
 ```
 
-### Почему ACK несколько
+Proxy A и Proxy B могут быть подключены к одному NATS, но не используют общую БД и не
+запускаются с одинаковым `proxy_id`.
 
-Core NATS не хранит сообщения, когда получатель недоступен. Поэтому сообщение можно
-считать надежно переданным только после того, как получатель:
+Клиентская библиотека не поднимает собственную БД. Клиентское приложение подключает к
+ней своё постоянное хранилище через интерфейс. В нём приложение хранит исходящий
+запрос, полученные подтверждения и результат.
 
-1. сохранил его в своей БД;
-2. отправил прикладной ACK;
-3. получил подтверждение, что отправитель сохранил ACK.
+Для согласованной схемы нужны обе durable-стороны:
 
-Потерянные промежуточные сообщения отправляются снова с теми же ID. Все операции
-идемпотентны. Это конечный handshake: если последнее подтверждение потерялось, клиент
-повторяет предыдущий ACK, а Proxy снова отвечает подтверждением.
+- БД Proxy нужна, чтобы Proxy не потерял очередь и результаты после рестарта;
+- хранилище клиента нужно, чтобы клиент продолжил обмен после своего рестарта.
 
-## Синхронность для вызывающего Go-кода
+## Исходящий HTTP
 
-NATS-протокол внутри асинхронный, но пакет [`client`](client/client.go) предоставляет
-обычный блокирующий метод:
+Короткая схема:
+
+```text
+Service A → сохранить запрос → NATS → Proxy → сохранить запрос
+Service A ← ACK ← Proxy
+Service A → сохранить ACK → подтвердить ACK → Proxy
+Proxy → записать «начинаю HTTP» → внешний HTTP
+Proxy ← HTTP-ответ
+Proxy → сначала отправить ответ клиенту → затем сохранить ответ
+Service A → сохранить ответ → ACK → Proxy → подтвердить ACK
+```
+
+Полная последовательность из 15 шагов и поведение при каждом сбое описаны в
+[docs/logic.md](docs/logic.md#полная-цепочка-обычного-http-запроса).
+
+## Ошибка с неизвестным результатом
+
+HTTP и PostgreSQL нельзя объединить в одну транзакцию. Если Proxy записал «начинаю
+HTTP» и после этого упал, неизвестно, получил ли внешний сервер запрос.
+
+В этом случае Proxy:
+
+1. не повторяет HTTP автоматически;
+2. отправляет клиенту ошибку «результат неизвестен»;
+3. повторяет доставку ошибки до ACK;
+4. после завершения обмена удаляет запись по обычному retention.
+
+Если клиент ранее уже сохранил успешный ответ, последующая ошибка не заменяет успех.
+Клиент подтверждает сообщение, но возвращает приложению сохранённый результат.
+
+## API клиентской библиотеки
+
+### Исходящие запросы
+
+Целевой клиент реализует стандартный `http.RoundTripper`, потому что `http.Client` в
+Go является структурой, а не интерфейсом.
 
 ```go
-result, err := proxyClient.Do(ctx, client.Request{
-    RequestID: "payment-status-123",
-    Method:    http.MethodGet,
-    URL:       "https://api.example.com/v1/payments/123",
+proxyTransport, err := proxyclient.NewTransport(config)
+if err != nil {
+    return err
+}
+
+httpClient := &http.Client{Transport: proxyTransport}
+response, err := httpClient.Do(request)
+```
+
+Это позволит существующему Go-коду работать через Proxy без отдельного нестандартного
+метода для каждого HTTP-запроса.
+
+### Callback
+
+Для callback клиентская библиотека принимает стандартный `http.Handler`:
+
+```go
+handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+    w.WriteHeader(http.StatusOK)
 })
+
+err := callbackClient.Serve(ctx, handler)
 ```
 
-`Do` возвращается только после получения HTTP-результата и завершения result ACK.
-Следующий вызов в той же goroutine естественно начнется позже. Для параллельной работы
-caller явно запускает несколько goroutine.
+Библиотека получает callback из NATS, создаёт обычный `http.Request`, вызывает handler
+и отправляет его status, headers и body обратно в Proxy.
 
-Proxy намеренно не сортирует запросы одного клиента. Порядок NATS и ACK не используется
-как бизнес-порядок; параллельные запросы считаются независимыми.
+## Несколько клиентов и Proxy в одном NATS
 
-Production-клиент обязан реализовать интерфейс `client.Store` на своей БД. Исходящий
-request сохраняется до первой публикации. `MemoryStore` предназначен только для тестов.
-
-## Состояния HTTP-операции
+Subjects содержат `proxy_id` и `client_id`:
 
 ```text
-awaiting_acceptance_ack
-          │ client durably confirmed acceptance
-          ▼
-        ready ──► reserved ──► dispatching ──► http_completed
-                     │              │                  │
-                     │ crash        │ lost outcome     │ result ACK
-                     ▼              ▼                  ▼
-                   ready          unknown       result_delivered
-                                    │ result ACK
-                                    ▼
-                             result_delivered
+proxy.<proxy_id>.requests
+client.<client_id>.proxy.<proxy_id>.results
 ```
 
-- `awaiting_acceptance_ack` — Proxy сохранил request, но клиент еще не подтвердил ACK;
-- `ready` — клиент знает, что повторять исходную команду больше не нужно;
-- `reserved` — worker зарезервировал запись, но HTTP еще не начат;
-- `dispatching` — флаг записан **до** физической HTTP-отправки;
-- `http_completed` — ответ сохранен в PostgreSQL;
-- `result_delivered` — клиент сохранил результат и подтвердил это;
-- `unknown` — HTTP мог выполниться, но durable-результат восстановить нельзя.
+Клиент отправляет каждый запрос одному явно выбранному Proxy. Proxy читает только свои
+subjects, проверяет Ed25519-подпись и разрешение клиента. NATS ACL дополнительно
+запрещает читать и публиковать чужие subjects.
 
-Истекший `reserved` безопасно возвращается в `ready`: HTTP еще не начинался. Истекший
-`dispatching` становится `unknown` и автоматически повторно не выполняется.
+Несколько клиентов могут работать с одним Proxy. Один клиент может использовать
+несколько Proxy, но один конкретный запрос всегда принадлежит одному `proxy_id`.
 
-## Неустранимая граница HTTP ↔ PostgreSQL
+## Callback
 
-HTTP-вызов внешнего сервера и запись в нашей БД не являются одной транзакцией.
-Exactly-once на этой границе невозможен без участия внешнего API.
+Внутренний сервис регистрирует callback через NATS и получает публичный URL с секретным
+токеном.
 
-Принята модель «лучше не выполнить повторно, чем создать дубль»:
+Поддерживаются два сценария:
 
-1. До HTTP Proxy фиксирует `dispatching`.
-2. После ответа сначала публикует результат клиенту через NATS.
-3. Затем сохраняет результат у себя.
-4. Ошибка сохранения результата никогда сама по себе не запускает второй HTTP-вызов.
-5. Пока процесс жив, он продолжает сохранять уже полученный результат.
-6. Если процесс потерял результат, операция становится `unknown`.
+- static: Proxy сохраняет callback и возвращает заранее настроенный HTTP-ответ;
+- delegated: Proxy передаёт callback назначенному клиенту и возвращает внешний ответ,
+  сформированный его `http.Handler`.
 
-Таким образом, результат получает два независимых шанса сохраниться: в БД клиента и в
-БД Proxy. Если недоступны оба пути и Proxy упал, восстановить ответ невозможно.
+Один callback могут слушать несколько клиентов. Для каждого создаётся независимая
+доставка. Только один клиент формирует синхронный HTTP-ответ внешнему сервису.
 
-## Retry
+## Разделение кода
 
-По умолчанию выполняется одна HTTP-попытка. Retry возможен только когда caller явно
-передал политику и запрос безопасен:
-
-- `GET`, `HEAD`, `OPTIONS`; или
-- caller выставил `idempotent=true`, потому что внешний API поддерживает idempotency
-  key, уже включенный клиентом в headers/body.
-
-Caller отдельно указывает retry сетевых ошибок и список HTTP status codes. Proxy не
-добавляет idempotency key самостоятельно и не понимает бизнес-смысл `POST`.
-
-## HTTP-контракт
-
-Request содержит:
-
-```json
-{
-  "request_id": "request-123",
-  "client_id": "service-a",
-  "proxy_id": "proxy-main",
-  "method": "POST",
-  "url": "https://api.example.com/v1/items?full=true",
-  "headers": [
-    {"name": "Content-Type", "value": "application/json"},
-    {"name": "X-Custom", "value": "one"},
-    {"name": "X-Custom", "value": "two"}
-  ],
-  "body": "base64-encoded-by-json",
-  "timeout": 30000000000,
-  "retry": {"max_attempts": 1}
-}
-```
-
-Headers представлены списком, чтобы не потерять повторяющиеся значения. Body —
-непрозрачные bytes; стандартный JSON encoder передает `[]byte` как base64.
-
-Proxy сохраняет method, URL/query, значения end-to-end headers и body. В результате
-сохраняются status code, значения headers и response body. Proxy не декодирует JSON,
-не распаковывает gzip и не следует за redirect автоматически.
-
-Стандартный `net/http` может изменить wire-представление: порядок и регистр headers,
-`Content-Length`, chunked framing и управление соединением. Побайтовая идентичность
-TCP-потока не является гарантией. Интеграция, подписывающая точный wire-пакет вместе с
-порядком headers, требует отдельного raw transport.
-
-## Connection pool
-
-На экземпляр Proxy создается один долгоживущий `http.Client`/`http.Transport`.
-Keep-alive включен, idle-соединения с тем же host используются повторно, HTTP/2 может
-мультиплексировать запросы. Response body всегда полностью читается и закрывается,
-чтобы соединение вернулось в pool. Если внешний сервер сам закрыл соединение, будет
-создано новое; гарантировать одно физическое соединение навсегда невозможно.
-
-## Ограничение нагрузки по host
-
-Конфигурация задает default и overrides:
-
-```env
-PROXY_DEFAULT_HOST_RPS=20
-PROXY_DEFAULT_HOST_CONCURRENCY=8
-PROXY_HOST_LIMITS=api.example.com=5:2;legacy.example.org:8443=1:1
-```
-
-PostgreSQL координирует rate window и concurrent permits между всеми репликами одного
-логического Proxy. Если permit пока недоступен, request остается в очереди. Это не
-whitelist: неизвестный host использует default limit.
-
-Текущий rate limit считает запросы в фиксированном секундном окне. Поэтому около
-границы двух секунд возможен короткий burst. Строгая минимальная пауза между запросами
-пока не реализована и должна быть отдельно согласована для provider-ов, которым она
-нужна.
-
-## Несколько Proxy и клиентов
-
-Клиент явно выбирает логический `proxy_id`. NATS subjects изолированы по нему, а Proxy
-проверяет Ed25519 identity и `PROXY_ALLOWED_CLIENTS`.
-
-Несколько физических экземпляров одного `proxy_id` используют:
-
-- одинаковую ACL и signing identity;
-- общий PostgreSQL;
-- одну NATS queue group;
-- отдельные локальные HTTP connection pools;
-- общий DB-backed host limiter.
-
-Повтор одного request всегда идет с тем же `request_id` и к тому же `proxy_id`.
-Автоматически переключать незавершенный небезопасный request на другой логический
-Proxy нельзя: второй Proxy может повторить внешний side effect.
-
-## NATS subjects
-
-| Направление | Subject |
-|---|---|
-| client → Proxy | `proxy.<proxy_id>.requests` |
-| Proxy → client | `client.<client_id>.proxy.<proxy_id>.accepted` |
-| client → Proxy | `proxy.<proxy_id>.accepted_acks` |
-| Proxy → client | `client.<client_id>.proxy.<proxy_id>.results` |
-| client → Proxy | `proxy.<proxy_id>.result_acks` |
-| Proxy → client | `client.<client_id>.proxy.<proxy_id>.ack_confirmed` |
-| webhook control | `proxy.<proxy_id>.webhooks.commands` |
-| webhook event | `client.<client_id>.proxy.<proxy_id>.webhooks.events` |
-| webhook ACK | `proxy.<proxy_id>.webhooks.acks` |
-
-NATS server ACL следует настроить дополнительно: клиент публикует только в subjects
-выбранного Proxy и читает только собственный `client.<client_id>.>`.
-
-## Ed25519
-
-Каждое сообщение помещается в envelope:
-
-```json
-{
-  "id": "random-envelope-id",
-  "type": "http.request.v1",
-  "timestamp": "2026-07-14T10:00:00Z",
-  "payload": {},
-  "key_id": "derived-key-id",
-  "signature": "base64-signature"
-}
-```
-
-Подписываются ID, type, UTC timestamp и точные bytes JSON payload. Proxy связывает
-public key с `client_id`, проверяет freshness и разрешение клиента для `proxy_id`.
-Private keys не должны храниться в репозитории.
-
-## Webhook
-
-### Регистрация
-
-Owner отправляет подписанную `webhook.register.v1` в webhook control subject. Команда
-содержит стабильный `command_id`, mode, subscribers, лимит body и настройки ответа.
-Proxy идемпотентно создает route и возвращает capability URL:
+После согласования код должен быть разделён по направлениям примерно так:
 
 ```text
-https://proxy.example.com/v1/webhooks/<webhook_id>/<secret-token>
+client/
+  outgoing/       http.RoundTripper и исходящий ACK-протокол
+  callback/       доставка callback в http.Handler
+
+internal/
+  outgoing/       NATS → очередь → внешний HTTP → результат
+  callback/       внешний HTTP → NATS → внешний HTTP-ответ
+  protocol/       общие ID, подписи и простые ACK
+  repository/     PostgreSQL
 ```
 
-Результат register сейчас публикуется через Core NATS без отдельной durable delivery.
-Если он потерялся, owner повторяет ту же команду с тем же `command_id` и получает тот
-же URL. Subscribe/delete выполняются идемпотентно, но отдельного success ACK для них
-пока нет; полноценный control ACK-протокол остается production-доработкой.
+Так исходящий Proxy и callback Proxy можно читать и изменять независимо. Общий код
+остаётся только там, где он действительно общий.
 
-Owner самостоятельно регистрирует этот URL у внешнего provider. Команды subscribe и
-delete доступны только owner; подписчиками могут быть только клиенты ACL этого Proxy.
-На текущем этапе control API поддерживает register, subscribe и delete. List/get,
-update, unsubscribe и rotation capability token в текущий scope не входят.
+## HTTP-данные
 
-Публичный webhook endpoint принимает `POST`. Поддержка других HTTP methods требует
-отдельного расширения контракта.
+Proxy сохраняет method, URL, query, значения headers и body. Redirect и прозрачная
+декомпрессия отключаются.
 
-### Static mode
+Стандартный `net/http` может технически изменить порядок или регистр заголовков,
+`Content-Length` и framing. Значения заголовков и body не меняются. Побайтовая копия
+TCP-пакета не гарантируется.
+
+## Повторы и нагрузка
+
+По умолчанию выполняется одна HTTP-попытка. Повтор write-запроса разрешается только
+клиентом и только при поддержке idempotency внешним сервисом.
+
+Для каждого внешнего host настраиваются RPS и количество одновременно выполняемых
+запросов. Лишние запросы остаются в очереди конкретного Proxy. HTTP-соединения по
+возможности используются повторно.
+
+## Структура текущего прототипа
 
 ```text
-provider → Proxy → PostgreSQL commit → configured HTTP response
-                         └──────────→ durable NATS fan-out
+cmd/proxy/                 запуск сервера и migrations
+client/                    текущий черновой клиент с методом Do
+internal/app/              HTTP endpoints и callback ingress
+internal/httpx/            выполнение внешнего HTTP
+internal/transport/        текущий общий Core NATS transport
+internal/repository/       PostgreSQL и migrations
+internal/worker/           текущая очередь исходящих запросов
 ```
 
-Proxy отвечает наружу только после DB commit. Каждому subscriber создается отдельная
-delivery и отдельный ACK. Недоступность одного subscriber не влияет на остальных.
+Каталоги `client/outgoing`, `client/callback`, `internal/outgoing` и
+`internal/callback` описывают целевую структуру и будут созданы при упрощении кода.
 
-### Delegated mode
-
-```text
-provider → Proxy → PostgreSQL → designated responder over NATS
-provider ← Proxy ← status + headers + body
-```
-
-Один клиент назначается responder. Внешнее HTTP-соединение остается открытым до его
-ответа. Остальные subscribers получают событие асинхронно. При timeout Proxy отвечает
-`504`, а provider может повторить callback. Повтор должен дедуплицироваться внутренним
-сервисом по provider event ID или бизнес-ключу; универсальный Proxy этого ID не знает.
-
-Provider-specific подпись проверяет сервис-получатель по переданным body и headers.
-Capability token защищает сам route. Подключаемые provider-specific auth handlers в
-текущую универсальную версию не входят.
-
-## Retention
-
-Фоновая очистка небольшими batches удаляет только завершенные HTTP-операции после
-`PROXY_RETENTION`. Активные и недоставленные records не удаляются. `unknown` по
-умолчанию хранится бессрочно; отдельный TTL включается явно. Webhook event удаляется
-только когда все его deliveries подтверждены и истек retention.
-
-При очень большом потоке следующим шагом будет date partitioning таблиц; текущая
-batch-очистка не берет длительные table locks.
-
-## Запуск локально
+## Локальный запуск
 
 ```bash
 docker compose up -d --build
 curl -i http://localhost:8080/health/ready
-curl http://localhost:8080/metrics
 ```
 
-Compose запускает PostgreSQL, обычный NATS без JetStream, Proxy и тестовый HTTP echo.
-Production migrations выполняются отдельно:
-
-```bash
-proxy migrate
-```
-
-В репозитории оставлена одна актуальная миграция `000001_initial`, которая сразу
-создает финальную схему. Она рассчитана на чистую БД. Если в окружении уже применялась
-старая версия миграции `000001`, нельзя просто заменить файл: migration runner сочтет
-ее выполненной. Для такой среды нужен отдельный переходный migration/export либо новая
-БД. Локальную БД без нужных данных можно пересоздать командой `docker compose down -v`
-и затем снова запустить Compose.
-
-## Проверки
+Проверки:
 
 ```bash
 make fmt
@@ -349,67 +223,11 @@ make test
 make build
 ```
 
-Интеграционный smoke с реальными NATS/PostgreSQL:
+## Документация
 
-```bash
-docker compose up -d --build
-docker run --rm --network proxy-server_default \
-  -e PROXY_INTEGRATION_NATS_URL=nats://nats:4222 \
-  -e PROXY_INTEGRATION_HTTP_URL=http://echo:5678/ \
-  -e PROXY_INTEGRATION_PROXY_URL=http://proxy:8080 \
-  -v "$PWD:/src" -w /src golang:1.25-alpine \
-  go test -run Integration -v ./client
-```
-
-Smoke покрывает исходящий HTTP с полным ACK-handshake, static webhook и delegated
-webhook response.
-
-## Наблюдаемость
-
-- `GET /health/live` — процесс жив;
-- `GET /health/ready` — HTTP listener, NATS и PostgreSQL готовы;
-- `GET /metrics` — requests по состояниям и pending deliveries;
-- JSON logs содержат `request_id`/`delivery_id`, но не request body или secrets.
-
-Алерты должны следить за ростом `ready`, `dispatching`, `unknown`, pending deliveries,
-ошибками PostgreSQL/NATS, HTTP latency и насыщением host limits.
-
-## Гарантии и ограничения
-
-Гарантируется:
-
-- после acceptance ACK request сохранен;
-- повтор request с тем же ID не создает вторую операцию;
-- HTTP не начинается до durable `dispatching`;
-- ошибка записи результата не запускает повторный HTTP автоматически;
-- сохраненный результат и webhook доставляются до ACK;
-- restart-safe работа через PostgreSQL leases;
-- at-least-once доставка NATS-сообщений с возможными дублями.
-
-Не гарантируется:
-
-- exactly-once внешний HTTP side effect;
-- побайтовая идентичность HTTP wire-пакета;
-- сохранение результата, если одновременно недоступны БД Proxy, клиент и падает процесс;
-- безопасный retry write-запроса без idempotency внешнего API;
-- порядок между параллельными goroutine;
-- возможность запросить статус или отменить операцию через отдельный management API —
-  такой API пока не реализован;
-- строгая пауза между запросами к host на границе секундного rate window;
-- ограничение destination: авторизованный клиент может обратиться к любому адресу,
-  включая внутренние адреса и metadata endpoints, доступные из сети Proxy.
-
-Последний пункт является осознанным бизнес-требованием. Его следует компенсировать
-строгими Ed25519/NATS ACL, аудитом, лимитами и сетевой сегментацией окружения.
-
-## Дополнительная документация
-
-- [Логика системы для технического директора](docs/logic-for-tech-director.md)
-- [Архитектура](wiki/architecture.md)
-- [Требования](wiki/requirements.md)
-- [Архитектурные решения](wiki/decisions.md)
-- [Открытые production-вопросы](wiki/open-questions.md)
+- [Логика системы](docs/logic.md)
+- [Открытые вопросы](wiki/open-questions.md)
 - [Production checklist](docs/production-checklist.md)
 - [Operations runbook](docs/runbook.md)
 - [SLO](docs/slo.md)
-- [Security policy](SECURITY.md)
+- [Security](SECURITY.md)

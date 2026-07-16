@@ -1,6 +1,6 @@
 # Index
 
-- [Логика для технического директора](../docs/logic-for-tech-director.md) — простое
+- [Логика для технического директора](../docs/logic.md) — простое
   описание нормальных и аварийных сценариев.
 - [Architecture](architecture.md) — proxy boundaries, reliability model, data flows, and extension points.
 - [Requirements](requirements.md) — extracted proxy requirements, assumptions, and contradictions.
