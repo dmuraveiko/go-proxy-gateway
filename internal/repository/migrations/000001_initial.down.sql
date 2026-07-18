@@ -1,7 +1,10 @@
 DROP TABLE IF EXISTS proxy_deliveries;
+DROP TABLE IF EXISTS proxy_webhook_commands;
 DROP TABLE IF EXISTS proxy_webhook_events;
 DROP TABLE IF EXISTS proxy_webhook_subscribers;
 DROP TABLE IF EXISTS proxy_webhook_routes;
 DROP TABLE IF EXISTS proxy_host_permits;
+DROP TABLE IF EXISTS proxy_host_last_dispatch;
 DROP TABLE IF EXISTS proxy_host_rate_windows;
 DROP TABLE IF EXISTS proxy_http_requests;
+DROP TABLE IF EXISTS proxy_identity;

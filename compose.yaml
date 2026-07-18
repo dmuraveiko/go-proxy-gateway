@@ -59,5 +59,24 @@ services:
     ports:
       - "8080:8080"
 
+  proxy-2:
+    build: .
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      nats:
+        condition: service_healthy
+      echo:
+        condition: service_started
+    environment:
+      PROXY_DATABASE_URL: postgres://proxy:proxy@postgres:5432/proxy?sslmode=disable
+      PROXY_NATS_URL: nats://nats:4222
+      PROXY_REQUIRE_SIGNATURE: "false"
+      PROXY_ALLOWED_CLIENTS: dev-client
+      PROXY_ID: proxy-main
+      PROXY_INSTANCE_ID: proxy-main-2
+      PROXY_PUBLIC_BASE_URL: http://localhost:8080
+      PROXY_WORKERS: "8"
+
 volumes:
   postgres-data:

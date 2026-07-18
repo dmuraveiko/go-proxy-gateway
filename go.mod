@@ -1,4 +1,4 @@
-module proxy-server
+module github.com/dmuraveiko/go-proxy-gateway
 
 go 1.25.0
 

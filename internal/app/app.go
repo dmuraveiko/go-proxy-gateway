@@ -15,8 +15,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"proxy-server/internal/contracts"
-	"proxy-server/internal/repository"
+	"github.com/dmuraveiko/go-proxy-gateway/internal/contracts"
+	"github.com/dmuraveiko/go-proxy-gateway/internal/repository"
 )
 
 type WebhookTransport interface {
@@ -40,7 +40,7 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("GET /health/live", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
 	mux.HandleFunc("GET /health/ready", a.readiness)
 	mux.HandleFunc("GET /metrics", a.metrics)
-	mux.HandleFunc("POST /v1/webhooks/{id}/{token}", a.webhook)
+	mux.HandleFunc("/v1/webhooks/{id}/{token}", a.webhook)
 	return http.MaxBytesHandler(mux, a.maxBody)
 }
 func (a *App) Run(ctx context.Context) error {
@@ -96,7 +96,11 @@ func (a *App) webhook(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "body too large", http.StatusRequestEntityTooLarge)
 		return
 	}
-	event := contracts.WebhookEvent{EventID: "event_" + randomID(), WebhookID: route.ID, Method: r.Method, RequestURI: r.URL.RequestURI(), Headers: headers(r.Header), Body: body, ReceivedAt: time.Now().UTC()}
+	eventHeaders := r.Header.Clone()
+	if r.Host != "" {
+		eventHeaders.Set("Host", r.Host)
+	}
+	event := contracts.WebhookEvent{EventID: "event_" + randomID(), WebhookID: route.ID, Method: r.Method, RequestURI: r.URL.RequestURI(), Headers: headers(eventHeaders), Body: body, ReceivedAt: time.Now().UTC()}
 	ctx := r.Context()
 	if route.Mode == "delegated" {
 		var cancel context.CancelFunc

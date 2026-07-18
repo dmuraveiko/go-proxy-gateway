@@ -9,14 +9,14 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/dmuraveiko/go-proxy-gateway/internal/app"
+	"github.com/dmuraveiko/go-proxy-gateway/internal/config"
+	"github.com/dmuraveiko/go-proxy-gateway/internal/httpx"
+	"github.com/dmuraveiko/go-proxy-gateway/internal/message"
+	"github.com/dmuraveiko/go-proxy-gateway/internal/repository"
+	"github.com/dmuraveiko/go-proxy-gateway/internal/transport"
+	"github.com/dmuraveiko/go-proxy-gateway/internal/worker"
 	"github.com/nats-io/nats.go"
-	"proxy-server/internal/app"
-	"proxy-server/internal/config"
-	"proxy-server/internal/httpx"
-	"proxy-server/internal/message"
-	"proxy-server/internal/repository"
-	"proxy-server/internal/transport"
-	"proxy-server/internal/worker"
 )
 
 func main() {
@@ -56,6 +56,9 @@ func run(log *slog.Logger) error {
 	}
 	if _, err = repo.Stats(ctx); err != nil {
 		return errors.New("database is not migrated; run `proxy migrate`")
+	}
+	if err = repo.BindProxyID(ctx, cfg.ProxyID); err != nil {
+		return err
 	}
 	opts := []nats.Option{nats.Name("http-nats-proxy:" + cfg.ProxyID + ":" + cfg.InstanceID), nats.Timeout(5 * time.Second), nats.MaxReconnects(-1), nats.ReconnectWait(time.Second)}
 	if cfg.NATSCredsFile != "" {
@@ -107,12 +110,7 @@ func maintenance(ctx context.Context, repo *repository.Repository, log *slog.Log
 	}
 	cleanup := func() {
 		before := time.Now().Add(-cfg.Retention)
-		var unknown *time.Time
-		if cfg.UnknownRetention > 0 {
-			v := time.Now().Add(-cfg.UnknownRetention)
-			unknown = &v
-		}
-		if n, err := repo.Cleanup(ctx, before, unknown, 1000); err != nil {
+		if n, err := repo.Cleanup(ctx, before, 1000); err != nil {
 			log.Error("retention cleanup", "error", err)
 		} else if n > 0 {
 			log.Info("retention cleanup", "deleted", n)

@@ -1,5 +1,4 @@
-// Package client provides the synchronous Go API used by internal services.
-// Transport is asynchronous Core NATS, while Do blocks until the final HTTP result.
+// Package client provides standard net/http adapters for HTTP-NATS Proxy.
 package client
 
 import (
@@ -7,27 +6,57 @@ import (
 	"crypto/ed25519"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"sync"
 	"time"
 
+	"github.com/dmuraveiko/go-proxy-gateway/internal/contracts"
+	"github.com/dmuraveiko/go-proxy-gateway/internal/message"
 	"github.com/nats-io/nats.go"
-	"proxy-server/internal/contracts"
-	"proxy-server/internal/message"
 )
 
 type Request = contracts.HTTPRequest
 type Result = contracts.HTTPResult
 type HeaderField = contracts.HeaderField
 type RetryPolicy = contracts.RetryPolicy
+type StaticHTTPResponse = contracts.StaticHTTPResponse
+type WebhookRegister = contracts.WebhookRegister
+type WebhookUpdate = contracts.WebhookUpdate
+type WebhookSubscribe = contracts.WebhookSubscribe
+type WebhookUnsubscribe = contracts.WebhookUnsubscribe
+type WebhookDelete = contracts.WebhookDelete
+type WebhookEvent = contracts.WebhookEvent
 
-// Store is the client's durable boundary. Production services must implement it
-// with their own database transactionally with the surrounding business operation.
+const (
+	StateOutgoing    = "outgoing"
+	StateAccepted    = "accepted"
+	StateResultSaved = "result_saved"
+	StateComplete    = "complete"
+)
+
+var ErrOperationNotFound = errors.New("proxy client operation not found")
+var ErrRequestConflict = errors.New("request_id already belongs to another request")
+
+type StoredOperation struct {
+	Request Request
+	Result  *Result
+	State   string
+}
+
+// Store is the durable boundary on the client side. PostgresStore is the default
+// implementation; applications only need a custom implementation for another DB.
 type Store interface {
 	SaveOutgoing(context.Context, Request) error
+	Load(context.Context, string) (StoredOperation, error)
+	ListPending(context.Context, int) ([]StoredOperation, error)
 	MarkAccepted(context.Context, string) error
-	SaveResult(context.Context, Result) error
+	SaveResult(context.Context, Result) (Result, error)
 	MarkComplete(context.Context, string) error
+}
+
+type CallbackStore interface {
+	// SaveCallback returns true when this delivery was already completed.
+	SaveCallback(context.Context, contracts.WebhookEvent) (bool, error)
+	MarkCallbackComplete(context.Context, string) error
 }
 
 type Config struct {
@@ -36,11 +65,40 @@ type Config struct {
 	ProxyPublicKey        ed25519.PublicKey
 	RequireProxySignature bool
 	RetryInterval         time.Duration
+	MaxRetryInterval      time.Duration
+	Retention             time.Duration
+	CleanupInterval       time.Duration
+	CallbackWorkers       int
 }
+
+type operationOutcome struct {
+	result Result
+	err    error
+}
+type operationRun struct {
+	done    chan struct{}
+	outcome operationOutcome
+}
+
 type Client struct {
 	nc    *nats.Conn
 	store Store
 	cfg   Config
+
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	mu            sync.Mutex
+	acceptance    map[string]chan contracts.Acceptance
+	results       map[string]chan Result
+	confirmed     map[string]chan struct{}
+	control       map[string]chan contracts.WebhookControlResult
+	running       map[string]*operationRun
+	subs          []*nats.Subscription
+	callbackSub   *nats.Subscription
+	callbackQueue chan *nats.Msg
+	closeStore    func()
+	wg            sync.WaitGroup
 }
 
 func New(nc *nats.Conn, store Store, cfg Config) (*Client, error) {
@@ -49,6 +107,9 @@ func New(nc *nats.Conn, store Store, cfg Config) (*Client, error) {
 	}
 	if cfg.ClientID == "" || cfg.ProxyID == "" {
 		return nil, errors.New("client_id and proxy_id are required")
+	}
+	if !natsToken(cfg.ClientID) || !natsToken(cfg.ProxyID) {
+		return nil, errors.New("client_id and proxy_id must each be a single NATS token")
 	}
 	if len(cfg.Signer) != ed25519.PrivateKeySize {
 		return nil, errors.New("client signing key is required")
@@ -59,116 +120,147 @@ func New(nc *nats.Conn, store Store, cfg Config) (*Client, error) {
 	if cfg.RetryInterval <= 0 {
 		cfg.RetryInterval = time.Second
 	}
-	return &Client{nc: nc, store: store, cfg: cfg}, nil
+	if cfg.MaxRetryInterval <= 0 {
+		cfg.MaxRetryInterval = 30 * time.Second
+	}
+	if cfg.Retention <= 0 {
+		cfg.Retention = 30 * 24 * time.Hour
+	}
+	if cfg.CleanupInterval <= 0 {
+		cfg.CleanupInterval = time.Hour
+	}
+	if cfg.CallbackWorkers <= 0 {
+		cfg.CallbackWorkers = 8
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	c := &Client{
+		nc: nc, store: store, cfg: cfg, ctx: ctx, cancel: cancel,
+		acceptance: map[string]chan contracts.Acceptance{},
+		results:    map[string]chan Result{}, confirmed: map[string]chan struct{}{},
+		control: map[string]chan contracts.WebhookControlResult{}, running: map[string]*operationRun{},
+	}
+	if err := c.subscribe(); err != nil {
+		cancel()
+		return nil, err
+	}
+	c.resumePending()
+	if cleaner, ok := store.(interface {
+		Cleanup(context.Context, time.Time, int) (int64, error)
+	}); ok {
+		c.wg.Add(1)
+		go c.cleanupLoop(cleaner)
+	}
+	return c, nil
 }
 
-// Do persists the request before its first publish and returns only after the
-// result is persisted by Store and the result-ACK handshake is complete.
-func (c *Client) Do(ctx context.Context, req Request) (Result, error) {
-	if req.RequestID == "" {
-		return Result{}, errors.New("request_id is required")
-	}
-	req.ClientID = c.cfg.ClientID
-	req.ProxyID = c.cfg.ProxyID
-	if req.CreatedAt.IsZero() {
-		req.CreatedAt = time.Now().UTC()
-	}
-	if err := c.store.SaveOutgoing(ctx, req); err != nil {
-		return Result{}, fmt.Errorf("persist outgoing request: %w", err)
-	}
-	accepted, err := c.nc.SubscribeSync(c.subject("accepted"))
-	if err != nil {
-		return Result{}, err
-	}
-	defer accepted.Unsubscribe()
-	results, err := c.nc.SubscribeSync(c.subject("results"))
-	if err != nil {
-		return Result{}, err
-	}
-	defer results.Unsubscribe()
-	confirmed, err := c.nc.SubscribeSync(c.subject("ack_confirmed"))
-	if err != nil {
-		return Result{}, err
-	}
-	defer confirmed.Unsubscribe()
-	if err = c.nc.Flush(); err != nil {
-		return Result{}, err
-	}
-	var acceptance contracts.Acceptance
-	for acceptance.RequestID == "" {
-		if err = c.publish(ctx, "proxy."+c.cfg.ProxyID+".requests", contracts.TypeHTTPRequest, req); err != nil && !errors.Is(err, context.DeadlineExceeded) {
-			return Result{}, err
-		}
-		deadline := time.Now().Add(c.cfg.RetryInterval)
-		for time.Now().Before(deadline) {
-			m, e := nextMessage(ctx, accepted, time.Until(deadline))
-			if e != nil {
-				if errors.Is(e, nats.ErrTimeout) || errors.Is(e, context.DeadlineExceeded) {
-					break
-				}
-				return Result{}, e
-			}
-			if c.decode(m, contracts.TypeAcceptance, &acceptance) == nil && acceptance.RequestID == req.RequestID {
-				break
-			}
-		}
-	}
-	if !acceptance.Accepted {
-		return Result{}, fmt.Errorf("proxy rejected request (%s): %s", acceptance.ErrorCode, acceptance.Error)
-	}
-	if err = c.store.MarkAccepted(ctx, req.RequestID); err != nil {
-		return Result{}, fmt.Errorf("persist acceptance: %w", err)
-	}
-	acceptACK := contracts.DeliveryACK{RequestID: req.RequestID, DeliveryID: acceptance.DeliveryID, ClientID: c.cfg.ClientID}
-	if err = c.ackUntilConfirmed(ctx, "proxy."+c.cfg.ProxyID+".accepted_acks", contracts.TypeAcceptanceACK, acceptACK, confirmed); err != nil {
-		return Result{}, err
-	}
-	for {
-		m, e := results.NextMsgWithContext(ctx)
-		if e != nil {
-			return Result{}, e
-		}
-		var result Result
-		if c.decode(m, contracts.TypeHTTPResult, &result) != nil || result.RequestID != req.RequestID {
-			continue
-		}
-		if err = c.store.SaveResult(ctx, result); err != nil {
-			return Result{}, fmt.Errorf("persist HTTP result: %w", err)
-		}
-		ack := contracts.DeliveryACK{RequestID: req.RequestID, DeliveryID: result.ResultID, ClientID: c.cfg.ClientID}
-		if err = c.ackUntilConfirmed(ctx, "proxy."+c.cfg.ProxyID+".result_acks", contracts.TypeResultACK, ack, confirmed); err != nil {
-			return Result{}, err
-		}
-		if err = c.store.MarkComplete(ctx, req.RequestID); err != nil {
-			return Result{}, err
-		}
-		if result.State == "unknown" {
-			return result, &OutcomeUnknownError{RequestID: req.RequestID, Cause: result.Error}
-		}
-		return result, nil
-	}
+// NewTransport is the preferred constructor for use as http.Client.Transport.
+func NewTransport(nc *nats.Conn, store Store, cfg Config) (*Client, error) {
+	return New(nc, store, cfg)
 }
-func (c *Client) ackUntilConfirmed(ctx context.Context, subject, typ string, ack contracts.DeliveryACK, sub *nats.Subscription) error {
-	for {
-		if err := c.publish(ctx, subject, typ, ack); err != nil && !errors.Is(err, context.DeadlineExceeded) {
+
+// OpenTransport is the shortest production setup: it creates/migrates the
+// built-in client tables and returns an http.RoundTripper.
+func OpenTransport(ctx context.Context, nc *nats.Conn, dsn string, cfg Config, options ...PostgresStoreOption) (*Client, error) {
+	store, err := OpenPostgresStore(ctx, dsn, options...)
+	if err != nil {
+		return nil, err
+	}
+	client, err := New(nc, store, cfg)
+	if err != nil {
+		store.Close()
+		return nil, err
+	}
+	client.closeStore = store.Close
+	return client, nil
+}
+
+func (c *Client) Close() error {
+	c.cancel()
+	c.mu.Lock()
+	subs := append([]*nats.Subscription(nil), c.subs...)
+	if c.callbackSub != nil {
+		subs = append(subs, c.callbackSub)
+	}
+	c.mu.Unlock()
+	for _, sub := range subs {
+		_ = sub.Drain()
+	}
+	c.wg.Wait()
+	if c.closeStore != nil {
+		c.closeStore()
+	}
+	return nil
+}
+
+func (c *Client) subscribe() error {
+	handlers := []struct {
+		suffix string
+		fn     nats.MsgHandler
+	}{
+		{"accepted", c.handleAcceptance},
+		{"results", c.handleResult},
+		{"ack_confirmed", c.handleConfirmed},
+		{"webhooks.control_results", c.handleControlResult},
+	}
+	for _, h := range handlers {
+		sub, err := c.nc.Subscribe(c.subject(h.suffix), h.fn)
+		if err != nil {
 			return err
 		}
-		deadline := time.Now().Add(c.cfg.RetryInterval)
-		for time.Now().Before(deadline) {
-			m, err := nextMessage(ctx, sub, time.Until(deadline))
-			if err != nil {
-				if errors.Is(err, nats.ErrTimeout) || errors.Is(err, context.DeadlineExceeded) {
-					break
-				}
-				return err
-			}
-			var confirmation contracts.ACKConfirmed
-			if c.decode(m, contracts.TypeACKConfirmed, &confirmation) == nil && confirmation.DeliveryID == ack.DeliveryID {
-				return nil
-			}
+		c.subs = append(c.subs, sub)
+	}
+	return c.nc.Flush()
+}
+
+func (c *Client) handleAcceptance(m *nats.Msg) {
+	var value contracts.Acceptance
+	if c.decode(m, contracts.TypeAcceptance, &value) != nil {
+		return
+	}
+	c.mu.Lock()
+	ch := c.acceptance[value.RequestID]
+	c.mu.Unlock()
+	trySend(ch, value)
+}
+
+func (c *Client) handleResult(m *nats.Msg) {
+	var value Result
+	if c.decode(m, contracts.TypeHTTPResult, &value) != nil {
+		return
+	}
+	c.mu.Lock()
+	ch := c.results[value.RequestID]
+	c.mu.Unlock()
+	trySend(ch, value)
+}
+
+func (c *Client) handleConfirmed(m *nats.Msg) {
+	var value contracts.ACKConfirmed
+	if c.decode(m, contracts.TypeACKConfirmed, &value) != nil {
+		return
+	}
+	c.mu.Lock()
+	ch := c.confirmed[value.DeliveryID]
+	c.mu.Unlock()
+	if ch != nil {
+		select {
+		case ch <- struct{}{}:
+		default:
 		}
 	}
 }
+
+func (c *Client) handleControlResult(m *nats.Msg) {
+	var value contracts.WebhookControlResult
+	if c.decode(m, contracts.TypeWebhookControlResult, &value) != nil {
+		return
+	}
+	c.mu.Lock()
+	ch := c.control[value.CommandID]
+	c.mu.Unlock()
+	trySend(ch, value)
+}
+
 func (c *Client) publish(ctx context.Context, subject, typ string, payload any) error {
 	env, err := message.NewEnvelope(typ, payload, c.cfg.Signer)
 	if err != nil {
@@ -183,6 +275,7 @@ func (c *Client) publish(ctx context.Context, subject, typ string, payload any) 
 	}
 	return c.nc.FlushWithContext(ctx)
 }
+
 func (c *Client) decode(m *nats.Msg, typ string, out any) error {
 	var env message.Envelope
 	if err := json.Unmarshal(m.Data, &env); err != nil {
@@ -198,55 +291,51 @@ func (c *Client) decode(m *nats.Msg, typ string, out any) error {
 	}
 	return json.Unmarshal(env.Payload, out)
 }
+
 func (c *Client) subject(suffix string) string {
 	return "client." + c.cfg.ClientID + ".proxy." + c.cfg.ProxyID + "." + suffix
 }
-func nextMessage(ctx context.Context, sub *nats.Subscription, timeout time.Duration) (*nats.Msg, error) {
-	waitCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	return sub.NextMsgWithContext(waitCtx)
+
+func (c *Client) cleanupLoop(cleaner interface {
+	Cleanup(context.Context, time.Time, int) (int64, error)
+}) {
+	defer c.wg.Done()
+	ticker := time.NewTicker(c.cfg.CleanupInterval)
+	defer ticker.Stop()
+	for {
+		_, _ = cleaner.Cleanup(c.ctx, time.Now().Add(-c.cfg.Retention), 1000)
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func trySend[T any](ch chan T, value T) {
+	if ch == nil {
+		return
+	}
+	select {
+	case ch <- value:
+	default:
+	}
+}
+
+func natsToken(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, character := range value {
+		if character == '.' || character == '*' || character == '>' || character == ' ' || character == '\t' || character == '\r' || character == '\n' {
+			return false
+		}
+	}
+	return true
 }
 
 type OutcomeUnknownError struct{ RequestID, Cause string }
 
 func (e *OutcomeUnknownError) Error() string {
 	return "HTTP outcome is unknown for " + e.RequestID + ": " + e.Cause
-}
-
-// MemoryStore is only for local development and tests; it is not restart-safe.
-type MemoryStore struct {
-	mu       sync.Mutex
-	Requests map[string]Request
-	Results  map[string]Result
-	States   map[string]string
-}
-
-func NewMemoryStore() *MemoryStore {
-	return &MemoryStore{Requests: map[string]Request{}, Results: map[string]Result{}, States: map[string]string{}}
-}
-func (s *MemoryStore) SaveOutgoing(_ context.Context, r Request) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.Requests[r.RequestID] = r
-	s.States[r.RequestID] = "outgoing"
-	return nil
-}
-func (s *MemoryStore) MarkAccepted(_ context.Context, id string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.States[id] = "accepted"
-	return nil
-}
-func (s *MemoryStore) SaveResult(_ context.Context, r Result) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.Results[r.RequestID] = r
-	s.States[r.RequestID] = "result_saved"
-	return nil
-}
-func (s *MemoryStore) MarkComplete(_ context.Context, id string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.States[id] = "complete"
-	return nil
 }

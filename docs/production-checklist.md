@@ -8,17 +8,17 @@
 - Ed25519 private keys выдаются через Vault/KMS/CSI, public keys и client ACL проверены.
 - Подтвердить бизнесом unrestricted destination, включая доступные внутренние адреса.
 - Настроить default и per-host RPS/concurrency на основе реальных provider limits.
-- Заменить fixed-window limiter прототипа на настраиваемые RPS/concurrency/min_interval
-  и проверить их нагрузочным тестом.
+- Проверить настроенные RPS/concurrency/min_interval нагрузочным тестом.
 - Настроить retention для завершённых операций и доставленных ошибок `unknown`.
 - Проверить static/delegated webhook timeout, capability URL и provider retry behavior.
-- Разрешить callback methods, которые передаёт provider, а не только текущий `POST`.
-- Добавить idempotent register/update/subscribe/unsubscribe/delete и полный durable
-  control ACK.
+- Проверить callback methods, которые передаёт каждый provider.
 - Решить, нужен ли отдельный status/cancel management API для HTTP-операций.
 - Load test на 2× peak; отдельно NATS loss, DB/disk-full, HTTP timeout и pod kill во время HTTP.
-- Проверить, что storage adapter клиента действительно durable и идемпотентен.
-- Проверить уникальность `proxy_id` и отдельную PostgreSQL каждого Proxy.
+- Проверить migrations, durability и идемпотентность встроенного клиентского
+  PostgreSQL Store с префиксом `natsproxyclient_`.
+- Проверить, что экземпляры одного `proxy_id` используют одну queue group и БД, имеют
+  разные `instance_id`, а разные `proxy_id` не делят БД.
 - Проверить совместимость исходящего клиента с `http.RoundTripper`, а callback — с
   `http.Handler`.
+- Расширить fault-injection тесты HMAC/URL/body на обрывы NATS и PostgreSQL.
 - Pin digest, SBOM, vulnerability scan, image signature, dashboards и alerts.

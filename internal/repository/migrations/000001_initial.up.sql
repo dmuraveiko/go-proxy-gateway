@@ -1,3 +1,8 @@
+CREATE TABLE proxy_identity (
+  singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+  proxy_id text NOT NULL UNIQUE
+);
+
 CREATE TABLE proxy_http_requests (
   request_id text PRIMARY KEY,
   client_id text NOT NULL,
@@ -35,6 +40,10 @@ CREATE TABLE proxy_host_permits (
   token text PRIMARY KEY,
   host text NOT NULL,
   lease_until timestamptz NOT NULL
+);
+CREATE TABLE proxy_host_last_dispatch (
+  host text PRIMARY KEY,
+  dispatched_at timestamptz NOT NULL
 );
 CREATE INDEX proxy_host_permits_host_idx
   ON proxy_host_permits(host, lease_until);
@@ -78,24 +87,38 @@ CREATE INDEX proxy_webhook_events_retention_idx
 CREATE INDEX proxy_webhook_events_route_idx
   ON proxy_webhook_events(webhook_id, received_at DESC);
 
+CREATE TABLE proxy_webhook_commands (
+  command_id text PRIMARY KEY,
+  client_id text NOT NULL,
+  command_type text NOT NULL,
+  payload jsonb NOT NULL,
+  result jsonb NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX proxy_webhook_commands_client_idx
+  ON proxy_webhook_commands(client_id, created_at DESC);
+
 CREATE TABLE proxy_deliveries (
   delivery_id text PRIMARY KEY,
-  kind text NOT NULL CHECK (kind IN ('acceptance', 'result', 'webhook')),
+  kind text NOT NULL CHECK (kind IN ('acceptance', 'result', 'webhook', 'control')),
   client_id text NOT NULL,
   subject text NOT NULL,
   message_type text NOT NULL,
   payload jsonb NOT NULL,
   request_id text REFERENCES proxy_http_requests(request_id) ON DELETE CASCADE,
   webhook_event_id text REFERENCES proxy_webhook_events(event_id) ON DELETE CASCADE,
+  command_id text REFERENCES proxy_webhook_commands(command_id) ON DELETE CASCADE,
   attempts integer NOT NULL DEFAULT 0 CHECK (attempts >= 0),
   next_attempt_at timestamptz NOT NULL DEFAULT now(),
   lease_until timestamptz,
   acknowledged_at timestamptz,
   created_at timestamptz NOT NULL DEFAULT now(),
   CHECK (
-    (kind IN ('acceptance', 'result') AND request_id IS NOT NULL AND webhook_event_id IS NULL)
+    (kind IN ('acceptance', 'result') AND request_id IS NOT NULL AND webhook_event_id IS NULL AND command_id IS NULL)
     OR
-    (kind = 'webhook' AND request_id IS NULL AND webhook_event_id IS NOT NULL)
+    (kind = 'webhook' AND request_id IS NULL AND webhook_event_id IS NOT NULL AND command_id IS NULL)
+    OR
+    (kind = 'control' AND request_id IS NULL AND webhook_event_id IS NULL AND command_id IS NOT NULL)
   )
 );
 CREATE INDEX proxy_deliveries_due_idx
@@ -105,3 +128,5 @@ CREATE INDEX proxy_deliveries_request_idx
   ON proxy_deliveries(request_id) WHERE request_id IS NOT NULL;
 CREATE INDEX proxy_deliveries_webhook_idx
   ON proxy_deliveries(webhook_event_id) WHERE webhook_event_id IS NOT NULL;
+CREATE INDEX proxy_deliveries_command_idx
+  ON proxy_deliveries(command_id) WHERE command_id IS NOT NULL;

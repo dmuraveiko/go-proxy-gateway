@@ -13,181 +13,143 @@ import (
 	"time"
 
 	"github.com/nats-io/nats.go"
-	"proxy-server/internal/contracts"
 )
 
-func TestIntegrationDo(t *testing.T) {
-	natsURL := os.Getenv("PROXY_INTEGRATION_NATS_URL")
-	target := os.Getenv("PROXY_INTEGRATION_HTTP_URL")
-	if natsURL == "" || target == "" {
-		t.Skip("integration environment is not configured")
-	}
-	nc, err := nats.Connect(natsURL)
+func integrationClient(t *testing.T) (*Client, *nats.Conn) {
+	t.Helper()
+	nc, err := nats.Connect(os.Getenv("PROXY_INTEGRATION_NATS_URL"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer nc.Close()
 	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
+		nc.Close()
 		t.Fatal(err)
 	}
-	store := NewMemoryStore()
-	client, err := New(nc, store, Config{ClientID: "dev-client", ProxyID: "proxy-main", Signer: privateKey, RetryInterval: 100 * time.Millisecond})
+	config := Config{ClientID: "dev-client", ProxyID: "proxy-main", Signer: privateKey, RetryInterval: 100 * time.Millisecond}
+	var client *Client
+	if dsn := os.Getenv("PROXY_INTEGRATION_DATABASE_URL"); dsn != "" {
+		client, err = OpenTransport(context.Background(), nc, dsn, config)
+	} else {
+		client, err = New(nc, NewMemoryStore(), config)
+	}
 	if err != nil {
+		nc.Close()
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	request := Request{RequestID: "smoke-" + time.Now().Format("150405.000000000"), Method: "GET", URL: target}
-	result, err := client.Do(ctx, request)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.StatusCode != 200 || !strings.Contains(string(result.Body), "proxy-smoke-ok") {
-		t.Fatalf("unexpected result: %+v", result)
-	}
-	// A restarted service can replay its durable request and resume both ACK
-	// handshakes without executing the external HTTP request again.
-	resumed, err := client.Do(ctx, request)
-	if err != nil || resumed.ResultID != result.ResultID {
-		t.Fatalf("resume failed: result=%+v err=%v", resumed, err)
-	}
+	t.Cleanup(func() { _ = client.Close(); nc.Close() })
+	return client, nc
 }
 
-func TestIntegrationStaticWebhook(t *testing.T) {
-	natsURL := os.Getenv("PROXY_INTEGRATION_NATS_URL")
-	proxyURL := os.Getenv("PROXY_INTEGRATION_PROXY_URL")
-	if natsURL == "" || proxyURL == "" {
+func TestIntegrationRoundTripper(t *testing.T) {
+	target := os.Getenv("PROXY_INTEGRATION_HTTP_URL")
+	if os.Getenv("PROXY_INTEGRATION_NATS_URL") == "" || target == "" {
 		t.Skip("integration environment is not configured")
 	}
-	nc, err := nats.Connect(natsURL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer nc.Close()
-	_, privateKey, _ := ed25519.GenerateKey(rand.Reader)
-	c, err := New(nc, NewMemoryStore(), Config{ClientID: "dev-client", ProxyID: "proxy-main", Signer: privateKey, RetryInterval: 100 * time.Millisecond})
-	if err != nil {
-		t.Fatal(err)
-	}
-	control, err := nc.SubscribeSync(c.subject("webhooks.control_results"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer control.Unsubscribe()
-	events, err := nc.SubscribeSync(c.subject("webhooks.events"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer events.Unsubscribe()
-	if err = nc.Flush(); err != nil {
-		t.Fatal(err)
-	}
-	commandID := "webhook-smoke-" + time.Now().Format("150405.000000000")
-	cmd := contracts.WebhookRegister{CommandID: commandID, ClientID: "dev-client", Name: "smoke", Mode: "static", SubscriberIDs: []string{"dev-client"}, StaticResponse: contracts.StaticHTTPResponse{StatusCode: 202, Body: []byte("accepted")}}
+	transport, _ := integrationClient(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	if err = c.publish(ctx, "proxy.proxy-main.webhooks.commands", contracts.TypeWebhookRegister, cmd); err != nil {
-		t.Fatal(err)
-	}
-	m, err := control.NextMsgWithContext(ctx)
+	requestID := "smoke-" + time.Now().Format("150405.000000000")
+	request, err := http.NewRequestWithContext(WithRequestID(ctx, requestID), http.MethodGet, target, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var registered contracts.WebhookRegisterResult
-	if err = c.decode(m, contracts.TypeWebhookRegisterResult, &registered); err != nil {
-		t.Fatal(err)
-	}
-	u, err := url.Parse(registered.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	response, err := http.Post(proxyURL+u.Path, "application/octet-stream", strings.NewReader("webhook-body"))
+	response, err := (&http.Client{Transport: transport}).Do(request)
 	if err != nil {
 		t.Fatal(err)
 	}
 	body, _ := io.ReadAll(response.Body)
 	response.Body.Close()
-	if response.StatusCode != 202 || string(body) != "accepted" {
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "proxy-smoke-ok") {
+		t.Fatalf("unexpected response: %d %q", response.StatusCode, body)
+	}
+
+	// The same stable request ID returns the stored result and never repeats HTTP.
+	replay, _ := http.NewRequestWithContext(WithRequestID(ctx, requestID), http.MethodGet, target, nil)
+	resumed, err := (&http.Client{Transport: transport}).Do(replay)
+	if err != nil || resumed.StatusCode != response.StatusCode {
+		t.Fatalf("resume failed: response=%+v err=%v", resumed, err)
+	}
+}
+
+func TestIntegrationStaticWebhookHandler(t *testing.T) {
+	proxyURL := os.Getenv("PROXY_INTEGRATION_PROXY_URL")
+	if os.Getenv("PROXY_INTEGRATION_NATS_URL") == "" || proxyURL == "" {
+		t.Skip("integration environment is not configured")
+	}
+	client, _ := integrationClient(t)
+	eventBody := make(chan string, 1)
+	if err := client.ServeCallbacks(http.HandlerFunc(func(_ http.ResponseWriter, request *http.Request) {
+		body, _ := io.ReadAll(request.Body)
+		eventBody <- string(body)
+	})); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	callback, err := client.RegisterCallback(ctx, WebhookRegister{
+		CommandID: "static-" + time.Now().Format("150405.000000000"), Name: "smoke", Mode: "static",
+		SubscriberIDs: []string{"dev-client"}, StaticResponse: StaticHTTPResponse{StatusCode: http.StatusAccepted, Body: []byte("accepted")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := http.Post(proxyURL+callbackPath(callback.URL), "application/octet-stream", strings.NewReader("webhook-body"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(response.Body)
+	response.Body.Close()
+	if response.StatusCode != http.StatusAccepted || string(body) != "accepted" {
 		t.Fatalf("static response %d %q", response.StatusCode, body)
 	}
-	eventMsg, err := events.NextMsgWithContext(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var event contracts.WebhookEvent
-	if err = c.decode(eventMsg, contracts.TypeWebhookEvent, &event); err != nil {
-		t.Fatal(err)
-	}
-	if string(event.Body) != "webhook-body" {
-		t.Fatalf("event body %q", event.Body)
-	}
-	ack := contracts.DeliveryACK{DeliveryID: event.DeliveryID, ClientID: "dev-client"}
-	if err = c.publish(ctx, "proxy.proxy-main.webhooks.acks", contracts.TypeWebhookEventACK, ack); err != nil {
-		t.Fatal(err)
+	select {
+	case body := <-eventBody:
+		if body != "webhook-body" {
+			t.Fatalf("event body %q", body)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
 	}
 }
 
-func TestIntegrationDelegatedWebhook(t *testing.T) {
-	natsURL, proxyURL := os.Getenv("PROXY_INTEGRATION_NATS_URL"), os.Getenv("PROXY_INTEGRATION_PROXY_URL")
-	if natsURL == "" || proxyURL == "" {
+func TestIntegrationDelegatedWebhookHandler(t *testing.T) {
+	proxyURL := os.Getenv("PROXY_INTEGRATION_PROXY_URL")
+	if os.Getenv("PROXY_INTEGRATION_NATS_URL") == "" || proxyURL == "" {
 		t.Skip("integration environment is not configured")
 	}
-	nc, err := nats.Connect(natsURL)
-	if err != nil {
+	client, _ := integrationClient(t)
+	if err := client.ServeCallbacks(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("X-Delegated", "yes")
+		writer.WriteHeader(http.StatusCreated)
+		_, _ = writer.Write([]byte("client-response"))
+	})); err != nil {
 		t.Fatal(err)
 	}
-	defer nc.Close()
-	_, privateKey, _ := ed25519.GenerateKey(rand.Reader)
-	c, err := New(nc, NewMemoryStore(), Config{ClientID: "dev-client", ProxyID: "proxy-main", Signer: privateKey, RetryInterval: 100 * time.Millisecond})
-	if err != nil {
-		t.Fatal(err)
-	}
-	control, _ := nc.SubscribeSync(c.subject("webhooks.control_results"))
-	defer control.Unsubscribe()
-	events, _ := nc.SubscribeSync(c.subject("webhooks.events"))
-	defer events.Unsubscribe()
-	_ = nc.Flush()
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	cmd := contracts.WebhookRegister{CommandID: "delegated-" + time.Now().Format("150405.000000000"), ClientID: "dev-client", Name: "delegated", Mode: "delegated", ResponderID: "dev-client", ResponseTimeout: 5 * time.Second}
-	if err = c.publish(ctx, "proxy.proxy-main.webhooks.commands", contracts.TypeWebhookRegister, cmd); err != nil {
-		t.Fatal(err)
-	}
-	m, err := control.NextMsgWithContext(ctx)
+	callback, err := client.RegisterCallback(ctx, WebhookRegister{
+		CommandID: "delegated-" + time.Now().Format("150405.000000000"), Name: "delegated", Mode: "delegated",
+		ResponderID: "dev-client", ResponseTimeout: 5 * time.Second,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	var registered contracts.WebhookRegisterResult
-	if err = c.decode(m, contracts.TypeWebhookRegisterResult, &registered); err != nil {
-		t.Fatal(err)
-	}
-	u, _ := url.Parse(registered.URL)
-	responderDone := make(chan error, 1)
-	go func() {
-		msg, e := events.NextMsgWithContext(ctx)
-		if e != nil {
-			responderDone <- e
-			return
-		}
-		var event contracts.WebhookEvent
-		if e = c.decode(msg, contracts.TypeWebhookEvent, &event); e != nil {
-			responderDone <- e
-			return
-		}
-		e = c.publish(ctx, event.ReplySubject, contracts.TypeWebhookDelegatedResponse, contracts.WebhookResponse{EventID: event.EventID, ClientID: "dev-client", StatusCode: 201, Headers: []contracts.HeaderField{{Name: "X-Delegated", Value: "yes"}}, Body: []byte("client-response")})
-		responderDone <- e
-	}()
-	response, err := http.Post(proxyURL+u.Path, "text/plain", strings.NewReader("question"))
+	response, err := http.Post(proxyURL+callbackPath(callback.URL), "text/plain", strings.NewReader("question"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	body, _ := io.ReadAll(response.Body)
 	response.Body.Close()
-	if response.StatusCode != 201 || response.Header.Get("X-Delegated") != "yes" || string(body) != "client-response" {
+	if response.StatusCode != http.StatusCreated || response.Header.Get("X-Delegated") != "yes" || string(body) != "client-response" {
 		t.Fatalf("delegated response %d %q", response.StatusCode, body)
 	}
-	if err = <-responderDone; err != nil {
-		t.Fatal(err)
+}
+
+func callbackPath(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return raw
 	}
+	return parsed.RequestURI()
 }

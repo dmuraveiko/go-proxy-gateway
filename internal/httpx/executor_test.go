@@ -2,6 +2,9 @@ package httpx
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -9,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"proxy-server/internal/contracts"
+	"github.com/dmuraveiko/go-proxy-gateway/internal/contracts"
 )
 
 func TestExecutorPreservesApplicationDataAndDoesNotRedirect(t *testing.T) {
@@ -24,6 +27,15 @@ func TestExecutorPreservesApplicationDataAndDoesNotRedirect(t *testing.T) {
 		if string(body) != "raw-body" {
 			t.Errorf("body=%q", body)
 		}
+		if r.RequestURI != "/call/%2Fkeep?b=2&a=%2F&a=1" {
+			t.Errorf("request URI changed: %q", r.RequestURI)
+		}
+		mac := hmac.New(sha256.New, []byte("secret"))
+		_, _ = mac.Write([]byte(r.RequestURI))
+		_, _ = mac.Write(body)
+		if r.Header.Get("X-Signature") != hex.EncodeToString(mac.Sum(nil)) {
+			t.Error("URL/body signature became invalid")
+		}
 		if got := r.Header.Values("X-Duplicate"); len(got) != 2 || got[0] != "one" || got[1] != "two" {
 			t.Errorf("duplicate headers=%v", got)
 		}
@@ -35,7 +47,11 @@ func TestExecutorPreservesApplicationDataAndDoesNotRedirect(t *testing.T) {
 	defer server.Close()
 	executor := New(1024, 10, 10, time.Minute)
 	defer executor.CloseIdleConnections()
-	result, err := executor.Do(context.Background(), contracts.HTTPRequest{Method: http.MethodPost, URL: server.URL + "/call", Headers: []contracts.HeaderField{{Name: "X-Duplicate", Value: "one"}, {Name: "X-Duplicate", Value: "two"}}, Body: []byte("raw-body")})
+	requestURI := "/call/%2Fkeep?b=2&a=%2F&a=1"
+	mac := hmac.New(sha256.New, []byte("secret"))
+	_, _ = mac.Write([]byte(requestURI))
+	_, _ = mac.Write([]byte("raw-body"))
+	result, err := executor.Do(context.Background(), contracts.HTTPRequest{Method: http.MethodPost, URL: server.URL + requestURI, Headers: []contracts.HeaderField{{Name: "X-Duplicate", Value: "one"}, {Name: "X-Duplicate", Value: "two"}, {Name: "X-Signature", Value: hex.EncodeToString(mac.Sum(nil))}}, Body: []byte("raw-body")})
 	if err != nil {
 		t.Fatal(err)
 	}

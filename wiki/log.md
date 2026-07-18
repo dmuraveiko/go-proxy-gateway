@@ -47,3 +47,19 @@ Compared the proposed target with the current prototype and recorded the remaini
 ## [2026-07-16] decision | Minimized architecture questions
 
 Resolved implementation-level choices locally: request IDs, cancellation after durable acceptance, no automatic proxy failover, explicit HTTP retries, durable callback control, provider deduplication boundary, configurable throttling and automatic retention. Reduced technical-director confirmation to three contract decisions: proxy/database identity, client-side durable storage and application-data versus wire-byte HTTP preservation.
+
+## [2026-07-16] decision | Client storage, proxy replicas and signed HTTP data
+
+Accepted a built-in client PostgreSQL Store with configurable `natsproxyclient_` table prefix, `http.RoundTripper`, multiple physical instances per logical proxy/database coordinated by NATS queue groups and DB leases, and exact preservation of signed URL/body data while allowing standard `net/http` header ordering and framing.
+
+## [2026-07-16] implementation | Standard client adapters and durable callbacks
+
+Implemented the built-in client PostgreSQL store and migrations, `http.RoundTripper`, automatic recovery of pending client operations, `http.Handler` callback adapter, durable callback control/result ACKs, automatic unknown-error completion, database-to-proxy identity binding, and a two-instance Core NATS integration environment. Verified outgoing HTTP plus static and delegated callbacks against real NATS and PostgreSQL.
+
+## [2026-07-16] implementation | Shared host pacing and retention
+
+Added PostgreSQL-coordinated per-host `min_interval` alongside RPS/concurrency, automatic cleanup for completed client operations/callbacks and acknowledged webhook control commands, and physically separated outgoing and callback client/transport code.
+
+## [2026-07-18] refactor | Functional code boundaries
+
+Split the NATS transport and PostgreSQL repository into explicit outgoing HTTP, callback, durable delivery, host-limit and maintenance files. Removed unused legacy webhook repository methods and merged duplicate webhook ACK handlers without changing the external protocol.

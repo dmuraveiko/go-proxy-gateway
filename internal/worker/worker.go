@@ -11,11 +11,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/dmuraveiko/go-proxy-gateway/internal/config"
+	"github.com/dmuraveiko/go-proxy-gateway/internal/contracts"
+	"github.com/dmuraveiko/go-proxy-gateway/internal/httpx"
+	"github.com/dmuraveiko/go-proxy-gateway/internal/repository"
 	"github.com/jackc/pgx/v5"
-	"proxy-server/internal/config"
-	"proxy-server/internal/contracts"
-	"proxy-server/internal/httpx"
-	"proxy-server/internal/repository"
 )
 
 type Publisher interface {
@@ -70,7 +70,7 @@ func (p *Pool) run(ctx context.Context) error {
 func (p *Pool) execute(ctx context.Context, op repository.Operation) error {
 	host := strings.ToLower(mustHost(op.Request.URL))
 	limit := p.cfg.LimitForHost(host)
-	permit, err := p.repo.AcquireHostPermit(ctx, host, limit.RPS, limit.Concurrency, p.cfg.MaxRequestTimeout+time.Minute)
+	permit, err := p.repo.AcquireHostPermit(ctx, host, limit.RPS, limit.Concurrency, limit.MinInterval, p.cfg.MaxRequestTimeout+time.Minute)
 	if errors.Is(err, repository.ErrNoPermit) {
 		_ = p.repo.ReleaseReserved(ctx, op.Request.RequestID, op.DispatchToken)
 		wait(ctx, 50*time.Millisecond)

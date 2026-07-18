@@ -13,6 +13,7 @@ import (
 type HostLimit struct {
 	RPS         int
 	Concurrency int
+	MinInterval time.Duration
 }
 
 type Config struct {
@@ -25,7 +26,7 @@ type Config struct {
 	Workers, DeliveryWorkers, DBMaxConns                               int
 	MaxMessageBytes, MaxRequestBytes, MaxResponseBytes                 int64
 	RequestTimeout, MaxRequestTimeout, DeliveryRetry                   time.Duration
-	DispatchLease, ShutdownTimeout, Retention, UnknownRetention        time.Duration
+	DispatchLease, ShutdownTimeout, Retention                          time.Duration
 	CleanupInterval                                                    time.Duration
 	DefaultHostLimit                                                   HostLimit
 	HostLimits                                                         map[string]HostLimit
@@ -73,6 +74,9 @@ func Load() (Config, error) {
 	if c.DefaultHostLimit.Concurrency, err = intVal("PROXY_DEFAULT_HOST_CONCURRENCY", 8); err != nil {
 		return c, err
 	}
+	if c.DefaultHostLimit.MinInterval, err = durationVal("PROXY_DEFAULT_HOST_MIN_INTERVAL", 0); err != nil {
+		return c, err
+	}
 	if c.HostLimits, err = hostLimits(os.Getenv("PROXY_HOST_LIMITS")); err != nil {
 		return c, err
 	}
@@ -100,9 +104,6 @@ func Load() (Config, error) {
 	if c.Retention, err = durationVal("PROXY_RETENTION", 30*24*time.Hour); err != nil {
 		return c, err
 	}
-	if c.UnknownRetention, err = durationVal("PROXY_UNKNOWN_RETENTION", 0); err != nil {
-		return c, err
-	}
 	if c.CleanupInterval, err = durationVal("PROXY_CLEANUP_INTERVAL", time.Hour); err != nil {
 		return c, err
 	}
@@ -115,7 +116,10 @@ func Load() (Config, error) {
 	if c.ProxyID == "" || strings.ContainsAny(c.ProxyID, ".*> ") {
 		return c, errors.New("PROXY_ID must be a single NATS token")
 	}
-	if c.Workers < 1 || c.DeliveryWorkers < 1 || c.DBMaxConns < 4 || c.DefaultHostLimit.RPS < 1 || c.DefaultHostLimit.Concurrency < 1 {
+	if c.InstanceID == "" || strings.ContainsAny(c.InstanceID, ".*> ") {
+		return c, errors.New("PROXY_INSTANCE_ID must be a single NATS token")
+	}
+	if c.Workers < 1 || c.DeliveryWorkers < 1 || c.DBMaxConns < 4 || c.DefaultHostLimit.RPS < 1 || c.DefaultHostLimit.Concurrency < 1 || c.DefaultHostLimit.MinInterval < 0 {
 		return c, errors.New("invalid sizing configuration")
 	}
 	if c.MaxRequestTimeout < c.RequestTimeout || c.DispatchLease <= c.MaxRequestTimeout {
@@ -190,7 +194,7 @@ func hostLimits(v string) (map[string]HostLimit, error) {
 			return nil, fmt.Errorf("invalid host limit %q", entry)
 		}
 		n := strings.Split(p[1], ":")
-		if len(n) != 2 {
+		if len(n) < 2 || len(n) > 3 {
 			return nil, fmt.Errorf("invalid host limit %q", entry)
 		}
 		rps, e1 := strconv.Atoi(n[0])
@@ -198,7 +202,14 @@ func hostLimits(v string) (map[string]HostLimit, error) {
 		if e1 != nil || e2 != nil || rps < 1 || concurrency < 1 {
 			return nil, fmt.Errorf("invalid host limit %q", entry)
 		}
-		out[strings.ToLower(p[0])] = HostLimit{RPS: rps, Concurrency: concurrency}
+		var minInterval time.Duration
+		if len(n) == 3 {
+			minInterval, e1 = time.ParseDuration(n[2])
+			if e1 != nil || minInterval < 0 {
+				return nil, fmt.Errorf("invalid host limit %q", entry)
+			}
+		}
+		out[strings.ToLower(p[0])] = HostLimit{RPS: rps, Concurrency: concurrency, MinInterval: minInterval}
 	}
 	return out, nil
 }

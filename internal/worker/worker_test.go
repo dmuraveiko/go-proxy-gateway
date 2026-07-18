@@ -4,7 +4,7 @@ import (
 	"net/http"
 	"testing"
 
-	"proxy-server/internal/contracts"
+	"github.com/dmuraveiko/go-proxy-gateway/internal/contracts"
 )
 
 func TestRetrySafety(t *testing.T) {

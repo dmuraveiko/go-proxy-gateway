@@ -10,8 +10,12 @@ const (
 	TypeResultACK                = "http.result_ack.v1"
 	TypeACKConfirmed             = "ack.confirmed.v1"
 	TypeWebhookRegister          = "webhook.register.v1"
-	TypeWebhookRegisterResult    = "webhook.register_result.v1"
+	TypeWebhookControlResult     = "webhook.control_result.v1"
+	TypeWebhookRegisterResult    = TypeWebhookControlResult
+	TypeWebhookControlACK        = "webhook.control_ack.v1"
 	TypeWebhookSubscribe         = "webhook.subscribe.v1"
+	TypeWebhookUnsubscribe       = "webhook.unsubscribe.v1"
+	TypeWebhookUpdate            = "webhook.update.v1"
 	TypeWebhookDelete            = "webhook.delete.v1"
 	TypeWebhookEvent             = "webhook.event.v1"
 	TypeWebhookEventACK          = "webhook.event_ack.v1"
@@ -101,17 +105,38 @@ type WebhookRegister struct {
 	MaxBodyBytes    int64              `json:"max_body_bytes,omitempty"`
 }
 
-type WebhookRegisterResult struct {
-	CommandID string `json:"command_id"`
-	WebhookID string `json:"webhook_id"`
-	URL       string `json:"url"`
+type WebhookControlResult struct {
+	CommandID  string `json:"command_id"`
+	DeliveryID string `json:"delivery_id"`
+	Action     string `json:"action"`
+	Success    bool   `json:"success"`
+	WebhookID  string `json:"webhook_id,omitempty"`
+	URL        string `json:"url,omitempty"`
+	ErrorCode  string `json:"error_code,omitempty"`
+	Error      string `json:"error,omitempty"`
 }
+
+type WebhookRegisterResult = WebhookControlResult
 
 type WebhookSubscribe struct {
 	CommandID    string `json:"command_id"`
 	ClientID     string `json:"client_id"`
 	WebhookID    string `json:"webhook_id"`
 	SubscriberID string `json:"subscriber_id"`
+}
+
+type WebhookUnsubscribe = WebhookSubscribe
+
+type WebhookUpdate struct {
+	CommandID       string             `json:"command_id"`
+	ClientID        string             `json:"client_id"`
+	WebhookID       string             `json:"webhook_id"`
+	Name            string             `json:"name"`
+	Mode            string             `json:"mode"`
+	StaticResponse  StaticHTTPResponse `json:"static_response"`
+	ResponderID     string             `json:"responder_id,omitempty"`
+	ResponseTimeout time.Duration      `json:"response_timeout,omitempty"`
+	MaxBodyBytes    int64              `json:"max_body_bytes,omitempty"`
 }
 
 type WebhookDelete struct {
@@ -134,6 +159,7 @@ type WebhookEvent struct {
 
 type WebhookResponse struct {
 	EventID    string        `json:"event_id"`
+	DeliveryID string        `json:"delivery_id"`
 	ClientID   string        `json:"client_id"`
 	StatusCode int           `json:"status_code"`
 	Headers    []HeaderField `json:"headers,omitempty"`

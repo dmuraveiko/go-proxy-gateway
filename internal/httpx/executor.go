@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"proxy-server/internal/contracts"
+	"github.com/dmuraveiko/go-proxy-gateway/internal/contracts"
 )
 
 type Executor struct {
