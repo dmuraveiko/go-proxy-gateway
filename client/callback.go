@@ -107,8 +107,8 @@ func (c *Client) ServeCallbacks(handler http.Handler) error {
 		return errors.New("client store does not implement CallbackStore")
 	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.callbackSub != nil {
+		c.mu.Unlock()
 		return errors.New("callback handler is already running")
 	}
 	c.callbackQueue = make(chan *nats.Msg, c.cfg.CallbackWorkers*64)
@@ -135,10 +135,16 @@ func (c *Client) ServeCallbacks(handler http.Handler) error {
 		}
 	})
 	if err != nil {
+		c.mu.Unlock()
 		return err
 	}
 	c.callbackSub = sub
-	return c.nc.Flush()
+	c.mu.Unlock()
+	if err = c.nc.Flush(); err != nil {
+		return err
+	}
+	c.resumeCallbacks(store)
+	return nil
 }
 
 func (c *Client) handleCallback(ctx context.Context, store CallbackStore, handler http.Handler, message *nats.Msg) {
@@ -146,12 +152,20 @@ func (c *Client) handleCallback(ctx context.Context, store CallbackStore, handle
 	if c.decode(message, contracts.TypeWebhookEvent, &event) != nil || event.DeliveryID == "" {
 		return
 	}
-	complete, err := store.SaveCallback(ctx, event)
+	if !c.beginCallback(event.DeliveryID) {
+		return
+	}
+	defer c.endCallback(event.DeliveryID)
+	stored, err := store.SaveCallback(ctx, event)
 	if err != nil {
 		return // no ACK: Proxy will deliver it again.
 	}
-	if complete {
+	if stored.Completed {
 		_ = c.confirmCallback(ctx, event)
+		return
+	}
+	if stored.Response != nil {
+		_ = c.deliverCallbackResponse(ctx, store, event, *stored.Response, false)
 		return
 	}
 	request, err := http.NewRequestWithContext(ctx, event.Method, event.RequestURI, bytes.NewReader(event.Body))
@@ -180,25 +194,13 @@ func (c *Client) handleCallback(ctx context.Context, store CallbackStore, handle
 			EventID: event.EventID, DeliveryID: event.DeliveryID, ClientID: c.cfg.ClientID,
 			StatusCode: recorder.status, Headers: requestHeadersFromMap(recorder.header), Body: recorder.body.Bytes(),
 		}
-		if err = c.publishAndConfirmCallback(ctx, event, response); err != nil {
+		if err = c.deliverCallbackResponse(ctx, store, event, response, true); err != nil {
 			return
 		}
-	} else if err = c.confirmCallback(ctx, event); err != nil {
 		return
 	}
-	delay := c.cfg.RetryInterval
-	for {
-		if err = store.MarkCallbackComplete(ctx, event.DeliveryID); err == nil {
-			return
-		}
-		timer := time.NewTimer(delay)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return
-		case <-timer.C:
-			delay = nextBackoff(delay, c.cfg.MaxRetryInterval)
-		}
+	if err = c.confirmCallback(ctx, event); err == nil {
+		_ = c.markCallbackComplete(ctx, store, event.DeliveryID)
 	}
 }
 
@@ -207,7 +209,7 @@ func (c *Client) confirmCallback(ctx context.Context, event contracts.WebhookEve
 	return c.ackUntilConfirmed(ctx, "proxy."+c.cfg.ProxyID+".webhooks.acks", contracts.TypeWebhookEventACK, ack)
 }
 
-func (c *Client) publishAndConfirmCallback(ctx context.Context, event contracts.WebhookEvent, response contracts.WebhookResponse) error {
+func (c *Client) deliverCallbackResponse(ctx context.Context, store CallbackStore, event contracts.WebhookEvent, response contracts.WebhookResponse, persist bool) error {
 	ch := make(chan struct{}, 2)
 	c.mu.Lock()
 	c.confirmed[event.DeliveryID] = ch
@@ -217,9 +219,25 @@ func (c *Client) publishAndConfirmCallback(ctx context.Context, event contracts.
 		delete(c.confirmed, event.DeliveryID)
 		c.mu.Unlock()
 	}()
+	// The deliberate exceptional ordering is handler -> NATS -> client DB. It gives
+	// Proxy a chance to persist the response even while the client DB is unavailable.
+	c.publishCallbackResponse(ctx, event.ReplySubject, response)
+	saved := !persist
+	confirmed := false
 	delay := c.cfg.RetryInterval
 	for {
-		_ = c.publish(ctx, event.ReplySubject, contracts.TypeWebhookDelegatedResponse, response)
+		if !saved {
+			saveCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			saveErr := store.SaveCallbackResponse(saveCtx, response)
+			cancel()
+			saved = saveErr == nil
+			if errors.Is(saveErr, ErrOperationNotFound) || errors.Is(saveErr, ErrRequestConflict) {
+				return saveErr
+			}
+		}
+		if saved && confirmed {
+			return c.markCallbackComplete(ctx, store, event.DeliveryID)
+		}
 		timer := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():
@@ -227,11 +245,74 @@ func (c *Client) publishAndConfirmCallback(ctx context.Context, event contracts.
 			return ctx.Err()
 		case <-ch:
 			timer.Stop()
+			confirmed = true
+		case <-timer.C:
+			if !confirmed {
+				c.publishCallbackResponse(ctx, event.ReplySubject, response)
+			}
+			delay = nextBackoff(delay, c.cfg.MaxRetryInterval)
+		}
+	}
+}
+
+func (c *Client) publishCallbackResponse(ctx context.Context, subject string, response contracts.WebhookResponse) {
+	// Core NATS has no broker-side ACK. Bound Flush so an unavailable NATS cannot
+	// prevent the next durable step (saving the response in the client database).
+	publishCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	_ = c.publish(publishCtx, subject, contracts.TypeWebhookDelegatedResponse, response)
+}
+
+func (c *Client) markCallbackComplete(ctx context.Context, store CallbackStore, deliveryID string) error {
+	delay := c.cfg.RetryInterval
+	for {
+		if err := store.MarkCallbackComplete(ctx, deliveryID); err == nil {
 			return nil
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
 		case <-timer.C:
 			delay = nextBackoff(delay, c.cfg.MaxRetryInterval)
 		}
 	}
+}
+
+func (c *Client) resumeCallbacks(store CallbackStore) {
+	callbacks, err := store.ListPendingCallbacks(c.ctx, 10_000)
+	if err != nil {
+		return
+	}
+	for _, stored := range callbacks {
+		if stored.Response == nil || stored.Completed || !c.beginCallback(stored.Event.DeliveryID) {
+			continue
+		}
+		stored := stored
+		c.wg.Add(1)
+		go func() {
+			defer c.wg.Done()
+			defer c.endCallback(stored.Event.DeliveryID)
+			_ = c.deliverCallbackResponse(c.ctx, store, stored.Event, *stored.Response, false)
+		}()
+	}
+}
+
+func (c *Client) beginCallback(deliveryID string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, running := c.callbackRuns[deliveryID]; running {
+		return false
+	}
+	c.callbackRuns[deliveryID] = struct{}{}
+	return true
+}
+
+func (c *Client) endCallback(deliveryID string) {
+	c.mu.Lock()
+	delete(c.callbackRuns, deliveryID)
+	c.mu.Unlock()
 }
 
 type callbackResponse struct {

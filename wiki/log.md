@@ -63,3 +63,11 @@ Added PostgreSQL-coordinated per-host `min_interval` alongside RPS/concurrency, 
 ## [2026-07-18] refactor | Functional code boundaries
 
 Split the NATS transport and PostgreSQL repository into explicit outgoing HTTP, callback, durable delivery, host-limit and maintenance files. Removed unused legacy webhook repository methods and merged duplicate webhook ACK handlers without changing the external protocol.
+
+## [2026-07-19] decision | Callback response recovery and default single instance
+
+Recorded one process per `proxy_id` as the normal deployment and retained shared-DB
+replicas only as an optional HA mode. Changed delegated callback completion to publish
+the handler response first, persist it in the client database second, and recover by
+resending the stored response without calling the handler again. Proxy response
+deduplication is bound to the original event and delivery IDs.

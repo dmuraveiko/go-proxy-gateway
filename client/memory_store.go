@@ -11,30 +11,74 @@ import (
 type MemoryStore struct {
 	mu         sync.Mutex
 	Operations map[string]StoredOperation
-	Callbacks  map[string]bool
+	Callbacks  map[string]StoredCallback
 }
 
 func NewMemoryStore() *MemoryStore {
-	return &MemoryStore{Operations: map[string]StoredOperation{}, Callbacks: map[string]bool{}}
+	return &MemoryStore{Operations: map[string]StoredOperation{}, Callbacks: map[string]StoredCallback{}}
 }
 
-func (s *MemoryStore) SaveCallback(_ context.Context, event contracts.WebhookEvent) (bool, error) {
+func (s *MemoryStore) SaveCallback(_ context.Context, event contracts.WebhookEvent) (StoredCallback, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	complete := s.Callbacks[event.DeliveryID]
-	if _, exists := s.Callbacks[event.DeliveryID]; !exists {
-		s.Callbacks[event.DeliveryID] = false
+	stored, exists := s.Callbacks[event.DeliveryID]
+	if exists {
+		if !sameCallbackEvent(stored.Event, event) {
+			return StoredCallback{}, ErrRequestConflict
+		}
+		return cloneCallback(stored), nil
 	}
-	return complete, nil
+	stored = StoredCallback{Event: event}
+	s.Callbacks[event.DeliveryID] = stored
+	return cloneCallback(stored), nil
+}
+
+func (s *MemoryStore) SaveCallbackResponse(_ context.Context, response contracts.WebhookResponse) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	stored, exists := s.Callbacks[response.DeliveryID]
+	if !exists {
+		return ErrOperationNotFound
+	}
+	if stored.Event.EventID != response.EventID {
+		return ErrRequestConflict
+	}
+	if stored.Response != nil && !sameCallbackResponse(*stored.Response, response) {
+		return ErrRequestConflict
+	}
+	copyResponse := response
+	stored.Response = &copyResponse
+	s.Callbacks[response.DeliveryID] = stored
+	return nil
+}
+
+func (s *MemoryStore) ListPendingCallbacks(_ context.Context, limit int) ([]StoredCallback, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if limit <= 0 {
+		limit = 1000
+	}
+	values := make([]StoredCallback, 0)
+	for _, value := range s.Callbacks {
+		if !value.Completed {
+			values = append(values, cloneCallback(value))
+			if len(values) == limit {
+				break
+			}
+		}
+	}
+	return values, nil
 }
 
 func (s *MemoryStore) MarkCallbackComplete(_ context.Context, deliveryID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, exists := s.Callbacks[deliveryID]; !exists {
+	stored, exists := s.Callbacks[deliveryID]
+	if !exists {
 		return ErrOperationNotFound
 	}
-	s.Callbacks[deliveryID] = true
+	stored.Completed = true
+	s.Callbacks[deliveryID] = stored
 	return nil
 }
 
@@ -121,6 +165,18 @@ func cloneOperation(value StoredOperation) StoredOperation {
 	if value.Result != nil {
 		copyResult := *value.Result
 		value.Result = &copyResult
+	}
+	return value
+}
+
+func cloneCallback(value StoredCallback) StoredCallback {
+	value.Event.Headers = append([]HeaderField(nil), value.Event.Headers...)
+	value.Event.Body = append([]byte(nil), value.Event.Body...)
+	if value.Response != nil {
+		response := *value.Response
+		response.Headers = append([]HeaderField(nil), response.Headers...)
+		response.Body = append([]byte(nil), response.Body...)
+		value.Response = &response
 	}
 	return value
 }

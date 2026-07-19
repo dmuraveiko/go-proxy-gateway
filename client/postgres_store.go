@@ -98,13 +98,15 @@ CREATE INDEX IF NOT EXISTS %s ON %s(updated_at) WHERE state <> 'complete';
 CREATE TABLE IF NOT EXISTS %s (
   delivery_id text PRIMARY KEY,
   event jsonb NOT NULL,
+  response jsonb,
   completed boolean NOT NULL DEFAULT false,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now()
 );
+ALTER TABLE %s ADD COLUMN IF NOT EXISTS response jsonb;
 CREATE INDEX IF NOT EXISTS %s ON %s(updated_at) WHERE completed = false;
 `, s.operations, quoteIdentifier(s.prefix+"operations_pending_idx"), s.operations,
-		s.callbacks, quoteIdentifier(s.prefix+"callback_pending_idx"), s.callbacks)
+		s.callbacks, s.callbacks, quoteIdentifier(s.prefix+"callback_pending_idx"), s.callbacks)
 	_, err := s.pool.Exec(ctx, query)
 	return err
 }
@@ -234,15 +236,101 @@ func (s *PostgresStore) MarkComplete(ctx context.Context, id string) error {
 	return err
 }
 
-func (s *PostgresStore) SaveCallback(ctx context.Context, event contracts.WebhookEvent) (bool, error) {
+func (s *PostgresStore) SaveCallback(ctx context.Context, event contracts.WebhookEvent) (StoredCallback, error) {
 	payload, err := json.Marshal(event)
 	if err != nil {
-		return false, err
+		return StoredCallback{}, err
 	}
-	query := fmt.Sprintf(`INSERT INTO %s(delivery_id,event) VALUES($1,$2) ON CONFLICT(delivery_id) DO UPDATE SET updated_at=now() RETURNING completed`, s.callbacks)
-	var complete bool
-	err = s.pool.QueryRow(ctx, query, event.DeliveryID, payload).Scan(&complete)
-	return complete, err
+	query := fmt.Sprintf(`INSERT INTO %s(delivery_id,event) VALUES($1,$2) ON CONFLICT(delivery_id) DO NOTHING`, s.callbacks)
+	if _, err = s.pool.Exec(ctx, query, event.DeliveryID, payload); err != nil {
+		return StoredCallback{}, err
+	}
+	var rawEvent, rawResponse []byte
+	var stored StoredCallback
+	err = s.pool.QueryRow(ctx, fmt.Sprintf(`SELECT event,COALESCE(response,'null'::jsonb),completed FROM %s WHERE delivery_id=$1`, s.callbacks), event.DeliveryID).Scan(&rawEvent, &rawResponse, &stored.Completed)
+	if err != nil {
+		return StoredCallback{}, err
+	}
+	if err = json.Unmarshal(rawEvent, &stored.Event); err != nil {
+		return StoredCallback{}, err
+	}
+	if !sameCallbackEvent(stored.Event, event) {
+		return StoredCallback{}, ErrRequestConflict
+	}
+	if string(rawResponse) != "null" {
+		var response contracts.WebhookResponse
+		if err = json.Unmarshal(rawResponse, &response); err != nil {
+			return StoredCallback{}, err
+		}
+		stored.Response = &response
+	}
+	return stored, nil
+}
+
+func (s *PostgresStore) SaveCallbackResponse(ctx context.Context, response contracts.WebhookResponse) error {
+	payload, err := json.Marshal(response)
+	if err != nil {
+		return err
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	var eventPayload, current []byte
+	err = tx.QueryRow(ctx, fmt.Sprintf(`SELECT event,COALESCE(response,'null'::jsonb) FROM %s WHERE delivery_id=$1 FOR UPDATE`, s.callbacks), response.DeliveryID).Scan(&eventPayload, &current)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrOperationNotFound
+	}
+	if err != nil {
+		return err
+	}
+	var event contracts.WebhookEvent
+	if json.Unmarshal(eventPayload, &event) != nil || event.EventID != response.EventID {
+		return ErrRequestConflict
+	}
+	if string(current) != "null" {
+		var stored contracts.WebhookResponse
+		if json.Unmarshal(current, &stored) != nil || !sameCallbackResponse(stored, response) {
+			return ErrRequestConflict
+		}
+		return tx.Commit(ctx)
+	}
+	if _, err = tx.Exec(ctx, fmt.Sprintf(`UPDATE %s SET response=$2,updated_at=now() WHERE delivery_id=$1`, s.callbacks), response.DeliveryID, payload); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (s *PostgresStore) ListPendingCallbacks(ctx context.Context, limit int) ([]StoredCallback, error) {
+	if limit <= 0 {
+		limit = 1000
+	}
+	rows, err := s.pool.Query(ctx, fmt.Sprintf(`SELECT event,COALESCE(response,'null'::jsonb),completed FROM %s WHERE completed=false ORDER BY created_at LIMIT $1`, s.callbacks), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var callbacks []StoredCallback
+	for rows.Next() {
+		var stored StoredCallback
+		var eventPayload, responsePayload []byte
+		if err = rows.Scan(&eventPayload, &responsePayload, &stored.Completed); err != nil {
+			return nil, err
+		}
+		if err = json.Unmarshal(eventPayload, &stored.Event); err != nil {
+			return nil, err
+		}
+		if string(responsePayload) != "null" {
+			var response contracts.WebhookResponse
+			if err = json.Unmarshal(responsePayload, &response); err != nil {
+				return nil, err
+			}
+			stored.Response = &response
+		}
+		callbacks = append(callbacks, stored)
+	}
+	return callbacks, rows.Err()
 }
 
 func (s *PostgresStore) MarkCallbackComplete(ctx context.Context, deliveryID string) error {
@@ -284,6 +372,18 @@ func jsonEqual(left, right []byte) bool {
 func sameRequest(left, right Request) bool {
 	left.CreatedAt = right.CreatedAt
 	left.Timeout = right.Timeout
+	a, errA := json.Marshal(left)
+	b, errB := json.Marshal(right)
+	return errA == nil && errB == nil && jsonEqual(a, b)
+}
+
+func sameCallbackEvent(left, right contracts.WebhookEvent) bool {
+	a, errA := json.Marshal(left)
+	b, errB := json.Marshal(right)
+	return errA == nil && errB == nil && jsonEqual(a, b)
+}
+
+func sameCallbackResponse(left, right contracts.WebhookResponse) bool {
 	a, errA := json.Marshal(left)
 	b, errB := json.Marshal(right)
 	return errA == nil && errB == nil && jsonEqual(a, b)

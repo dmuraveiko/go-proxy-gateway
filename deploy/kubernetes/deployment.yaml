@@ -3,7 +3,7 @@ kind: Deployment
 metadata:
   name: http-nats-proxy
 spec:
-  replicas: 3
+  replicas: 1
   selector:
     matchLabels: {app: http-nats-proxy}
   template:
@@ -41,6 +41,6 @@ kind: PodDisruptionBudget
 metadata:
   name: http-nats-proxy
 spec:
-  minAvailable: 2
+  minAvailable: 1
   selector:
     matchLabels: {app: http-nats-proxy}

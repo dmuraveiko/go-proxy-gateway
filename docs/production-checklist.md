@@ -16,8 +16,9 @@
 - Load test на 2× peak; отдельно NATS loss, DB/disk-full, HTTP timeout и pod kill во время HTTP.
 - Проверить migrations, durability и идемпотентность встроенного клиентского
   PostgreSQL Store с префиксом `natsproxyclient_`.
-- Проверить, что экземпляры одного `proxy_id` используют одну queue group и БД, имеют
-  разные `instance_id`, а разные `proxy_id` не делят БД.
+- Штатно запускать один процесс на `proxy_id`. Если включается HA, проверить общую
+  queue group/БД, разные `instance_id` и влияние конкуренции на PostgreSQL и host
+  limiter. Разные `proxy_id` не должны делить БД.
 - Проверить совместимость исходящего клиента с `http.RoundTripper`, а callback — с
   `http.Handler`.
 - Расширить fault-injection тесты HMAC/URL/body на обрывы NATS и PostgreSQL.

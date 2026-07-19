@@ -213,6 +213,13 @@ func (r *Repository) SaveWebhookResponse(ctx context.Context, response contracts
 		return err
 	}
 	defer transaction.Rollback(ctx)
+	var deliveryExists bool
+	if err = transaction.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM proxy_deliveries WHERE delivery_id=$1 AND webhook_event_id=$2 AND client_id=$3 AND kind='webhook')`, response.DeliveryID, response.EventID, response.ClientID).Scan(&deliveryExists); err != nil {
+		return err
+	}
+	if !deliveryExists {
+		return errors.New("webhook response does not match its delivery")
+	}
 	tag, err := transaction.Exec(ctx, `UPDATE proxy_webhook_events e SET response=$2,status='responded',updated_at=now() FROM proxy_webhook_routes r WHERE e.event_id=$1 AND r.webhook_id=e.webhook_id AND r.mode='delegated' AND r.responder_client_id=$3 AND e.status='awaiting_response'`, response.EventID, payload, response.ClientID)
 	if err == nil && tag.RowsAffected() == 0 {
 		var existing []byte

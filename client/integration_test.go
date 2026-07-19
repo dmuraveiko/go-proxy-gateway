@@ -4,14 +4,18 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/dmuraveiko/go-proxy-gateway/internal/contracts"
+	"github.com/dmuraveiko/go-proxy-gateway/internal/message"
 	"github.com/nats-io/nats.go"
 )
 
@@ -144,6 +148,85 @@ func TestIntegrationDelegatedWebhookHandler(t *testing.T) {
 	if response.StatusCode != http.StatusCreated || response.Header.Get("X-Delegated") != "yes" || string(body) != "client-response" {
 		t.Fatalf("delegated response %d %q", response.StatusCode, body)
 	}
+}
+
+func TestIntegrationSavedCallbackResponseSkipsHandler(t *testing.T) {
+	if os.Getenv("PROXY_INTEGRATION_NATS_URL") == "" || os.Getenv("PROXY_INTEGRATION_DATABASE_URL") == "" {
+		t.Skip("integration environment is not configured")
+	}
+	client, nc := integrationClient(t)
+	store := client.store.(CallbackStore)
+	unique := time.Now().Format("150405.000000000")
+	event := contracts.WebhookEvent{
+		EventID: "recover-event-" + unique, DeliveryID: "recover-delivery-" + unique,
+		WebhookID: "recover-webhook", Method: http.MethodPost, RequestURI: "/recover",
+		ReplySubject: "test.callback.responses." + unique,
+	}
+	if _, err := store.SaveCallback(context.Background(), event); err != nil {
+		t.Fatal(err)
+	}
+	response := contracts.WebhookResponse{
+		EventID: event.EventID, DeliveryID: event.DeliveryID, ClientID: "dev-client",
+		StatusCode: http.StatusCreated, Body: []byte("saved-response"),
+	}
+	if err := store.SaveCallbackResponse(context.Background(), response); err != nil {
+		t.Fatal(err)
+	}
+
+	received := make(chan struct{}, 1)
+	_, err := nc.Subscribe(event.ReplySubject, func(natsMessage *nats.Msg) {
+		var envelope message.Envelope
+		if json.Unmarshal(natsMessage.Data, &envelope) != nil || envelope.Type != contracts.TypeWebhookDelegatedResponse {
+			return
+		}
+		confirmation, envelopeErr := message.NewEnvelope(contracts.TypeACKConfirmed, contracts.ACKConfirmed{DeliveryID: event.DeliveryID, ConfirmedAt: time.Now().UTC()}, nil)
+		if envelopeErr != nil {
+			return
+		}
+		data, _ := json.Marshal(confirmation)
+		_ = nc.Publish("client.dev-client.proxy.proxy-main.ack_confirmed", data)
+		_ = nc.Flush()
+		select {
+		case received <- struct{}{}:
+		default:
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = nc.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	var handlerCalls atomic.Int32
+	if err = client.ServeCallbacks(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		handlerCalls.Add(1)
+	})); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-received:
+	case <-time.After(5 * time.Second):
+		t.Fatal("saved callback response was not resent")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		pending, listErr := store.ListPendingCallbacks(context.Background(), 100)
+		if listErr == nil {
+			found := false
+			for _, callback := range pending {
+				found = found || callback.Event.DeliveryID == event.DeliveryID
+			}
+			if !found {
+				if handlerCalls.Load() != 0 {
+					t.Fatalf("handler was called %d times", handlerCalls.Load())
+				}
+				return
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("saved callback response was not marked complete")
 }
 
 func callbackPath(raw string) string {

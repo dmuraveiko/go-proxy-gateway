@@ -42,6 +42,15 @@ type StoredOperation struct {
 	State   string
 }
 
+// StoredCallback is the durable client-side state of one Proxy delivery.
+// Response is set after the handler has completed. A non-nil response means
+// recovery must only resend it and must never call the handler again.
+type StoredCallback struct {
+	Event     WebhookEvent
+	Response  *contracts.WebhookResponse
+	Completed bool
+}
+
 // Store is the durable boundary on the client side. PostgresStore is the default
 // implementation; applications only need a custom implementation for another DB.
 type Store interface {
@@ -54,8 +63,9 @@ type Store interface {
 }
 
 type CallbackStore interface {
-	// SaveCallback returns true when this delivery was already completed.
-	SaveCallback(context.Context, contracts.WebhookEvent) (bool, error)
+	SaveCallback(context.Context, contracts.WebhookEvent) (StoredCallback, error)
+	SaveCallbackResponse(context.Context, contracts.WebhookResponse) error
+	ListPendingCallbacks(context.Context, int) ([]StoredCallback, error)
 	MarkCallbackComplete(context.Context, string) error
 }
 
@@ -94,6 +104,7 @@ type Client struct {
 	confirmed     map[string]chan struct{}
 	control       map[string]chan contracts.WebhookControlResult
 	running       map[string]*operationRun
+	callbackRuns  map[string]struct{}
 	subs          []*nats.Subscription
 	callbackSub   *nats.Subscription
 	callbackQueue chan *nats.Msg
@@ -138,6 +149,7 @@ func New(nc *nats.Conn, store Store, cfg Config) (*Client, error) {
 		acceptance: map[string]chan contracts.Acceptance{},
 		results:    map[string]chan Result{}, confirmed: map[string]chan struct{}{},
 		control: map[string]chan contracts.WebhookControlResult{}, running: map[string]*operationRun{},
+		callbackRuns: map[string]struct{}{},
 	}
 	if err := c.subscribe(); err != nil {
 		cancel()
