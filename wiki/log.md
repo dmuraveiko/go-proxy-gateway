@@ -71,3 +71,11 @@ replicas only as an optional HA mode. Changed delegated callback completion to p
 the handler response first, persist it in the client database second, and recover by
 resending the stored response without calling the handler again. Proxy response
 deduplication is bound to the original event and delivery IDs.
+
+## [2026-07-20] implementation | Multi-proxy client storage isolation
+
+Changed the built-in client Store to use `(proxy_id, request_id)` and
+`(proxy_id, delivery_id)` primary keys, filter recovery by Proxy, and include
+`proxy_id` in webhook events. Added an in-place migration from the previous single-ID
+client tables and integration coverage for identical IDs belonging to different
+Proxy instances.

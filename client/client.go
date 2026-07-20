@@ -55,18 +55,18 @@ type StoredCallback struct {
 // implementation; applications only need a custom implementation for another DB.
 type Store interface {
 	SaveOutgoing(context.Context, Request) error
-	Load(context.Context, string) (StoredOperation, error)
-	ListPending(context.Context, int) ([]StoredOperation, error)
-	MarkAccepted(context.Context, string) error
-	SaveResult(context.Context, Result) (Result, error)
-	MarkComplete(context.Context, string) error
+	Load(context.Context, string, string) (StoredOperation, error)
+	ListPending(context.Context, string, int) ([]StoredOperation, error)
+	MarkAccepted(context.Context, string, string) error
+	SaveResult(context.Context, string, Result) (Result, error)
+	MarkComplete(context.Context, string, string) error
 }
 
 type CallbackStore interface {
 	SaveCallback(context.Context, contracts.WebhookEvent) (StoredCallback, error)
-	SaveCallbackResponse(context.Context, contracts.WebhookResponse) error
-	ListPendingCallbacks(context.Context, int) ([]StoredCallback, error)
-	MarkCallbackComplete(context.Context, string) error
+	SaveCallbackResponse(context.Context, string, contracts.WebhookResponse) error
+	ListPendingCallbacks(context.Context, string, int) ([]StoredCallback, error)
+	MarkCallbackComplete(context.Context, string, string) error
 }
 
 type Config struct {

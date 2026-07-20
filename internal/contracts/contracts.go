@@ -148,6 +148,7 @@ type WebhookDelete struct {
 type WebhookEvent struct {
 	EventID      string        `json:"event_id"`
 	DeliveryID   string        `json:"delivery_id"`
+	ProxyID      string        `json:"proxy_id"`
 	WebhookID    string        `json:"webhook_id"`
 	Method       string        `json:"method"`
 	RequestURI   string        `json:"request_uri"`

@@ -21,7 +21,8 @@ func NewMemoryStore() *MemoryStore {
 func (s *MemoryStore) SaveCallback(_ context.Context, event contracts.WebhookEvent) (StoredCallback, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	stored, exists := s.Callbacks[event.DeliveryID]
+	key := storeKey(event.ProxyID, event.DeliveryID)
+	stored, exists := s.Callbacks[key]
 	if exists {
 		if !sameCallbackEvent(stored.Event, event) {
 			return StoredCallback{}, ErrRequestConflict
@@ -29,14 +30,15 @@ func (s *MemoryStore) SaveCallback(_ context.Context, event contracts.WebhookEve
 		return cloneCallback(stored), nil
 	}
 	stored = StoredCallback{Event: event}
-	s.Callbacks[event.DeliveryID] = stored
+	s.Callbacks[key] = stored
 	return cloneCallback(stored), nil
 }
 
-func (s *MemoryStore) SaveCallbackResponse(_ context.Context, response contracts.WebhookResponse) error {
+func (s *MemoryStore) SaveCallbackResponse(_ context.Context, proxyID string, response contracts.WebhookResponse) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	stored, exists := s.Callbacks[response.DeliveryID]
+	key := storeKey(proxyID, response.DeliveryID)
+	stored, exists := s.Callbacks[key]
 	if !exists {
 		return ErrOperationNotFound
 	}
@@ -48,11 +50,11 @@ func (s *MemoryStore) SaveCallbackResponse(_ context.Context, response contracts
 	}
 	copyResponse := response
 	stored.Response = &copyResponse
-	s.Callbacks[response.DeliveryID] = stored
+	s.Callbacks[key] = stored
 	return nil
 }
 
-func (s *MemoryStore) ListPendingCallbacks(_ context.Context, limit int) ([]StoredCallback, error) {
+func (s *MemoryStore) ListPendingCallbacks(_ context.Context, proxyID string, limit int) ([]StoredCallback, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if limit <= 0 {
@@ -60,7 +62,7 @@ func (s *MemoryStore) ListPendingCallbacks(_ context.Context, limit int) ([]Stor
 	}
 	values := make([]StoredCallback, 0)
 	for _, value := range s.Callbacks {
-		if !value.Completed {
+		if value.Event.ProxyID == proxyID && !value.Completed {
 			values = append(values, cloneCallback(value))
 			if len(values) == limit {
 				break
@@ -70,47 +72,49 @@ func (s *MemoryStore) ListPendingCallbacks(_ context.Context, limit int) ([]Stor
 	return values, nil
 }
 
-func (s *MemoryStore) MarkCallbackComplete(_ context.Context, deliveryID string) error {
+func (s *MemoryStore) MarkCallbackComplete(_ context.Context, proxyID, deliveryID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	stored, exists := s.Callbacks[deliveryID]
+	key := storeKey(proxyID, deliveryID)
+	stored, exists := s.Callbacks[key]
 	if !exists {
 		return ErrOperationNotFound
 	}
 	stored.Completed = true
-	s.Callbacks[deliveryID] = stored
+	s.Callbacks[key] = stored
 	return nil
 }
 
 func (s *MemoryStore) SaveOutgoing(_ context.Context, request Request) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if existing, ok := s.Operations[request.RequestID]; ok {
+	key := storeKey(request.ProxyID, request.RequestID)
+	if existing, ok := s.Operations[key]; ok {
 		if sameRequest(existing.Request, request) {
 			return nil
 		}
 		return ErrRequestConflict
 	}
-	s.Operations[request.RequestID] = StoredOperation{Request: request, State: StateOutgoing}
+	s.Operations[key] = StoredOperation{Request: request, State: StateOutgoing}
 	return nil
 }
 
-func (s *MemoryStore) Load(_ context.Context, id string) (StoredOperation, error) {
+func (s *MemoryStore) Load(_ context.Context, proxyID, id string) (StoredOperation, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	value, ok := s.Operations[id]
+	value, ok := s.Operations[storeKey(proxyID, id)]
 	if !ok {
 		return StoredOperation{}, ErrOperationNotFound
 	}
 	return cloneOperation(value), nil
 }
 
-func (s *MemoryStore) ListPending(_ context.Context, limit int) ([]StoredOperation, error) {
+func (s *MemoryStore) ListPending(_ context.Context, proxyID string, limit int) ([]StoredOperation, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	values := make([]StoredOperation, 0)
 	for _, value := range s.Operations {
-		if value.State != StateComplete {
+		if value.Request.ProxyID == proxyID && value.State != StateComplete {
 			values = append(values, cloneOperation(value))
 			if len(values) == limit {
 				break
@@ -120,24 +124,29 @@ func (s *MemoryStore) ListPending(_ context.Context, limit int) ([]StoredOperati
 	return values, nil
 }
 
-func (s *MemoryStore) MarkAccepted(_ context.Context, id string) error {
+func (s *MemoryStore) MarkAccepted(_ context.Context, proxyID, id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	value, ok := s.Operations[id]
+	key := storeKey(proxyID, id)
+	value, ok := s.Operations[key]
 	if !ok {
 		return ErrOperationNotFound
 	}
 	value.State = StateAccepted
-	s.Operations[id] = value
+	s.Operations[key] = value
 	return nil
 }
 
-func (s *MemoryStore) SaveResult(_ context.Context, result Result) (Result, error) {
+func (s *MemoryStore) SaveResult(_ context.Context, proxyID string, result Result) (Result, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	value, ok := s.Operations[result.RequestID]
+	key := storeKey(proxyID, result.RequestID)
+	value, ok := s.Operations[key]
 	if !ok {
 		return Result{}, ErrOperationNotFound
+	}
+	if result.ProxyID != proxyID {
+		return Result{}, ErrRequestConflict
 	}
 	if value.Result != nil && value.Result.State != "unknown" && result.State == "unknown" {
 		return *value.Result, nil
@@ -145,19 +154,20 @@ func (s *MemoryStore) SaveResult(_ context.Context, result Result) (Result, erro
 	copyResult := result
 	value.Result = &copyResult
 	value.State = StateResultSaved
-	s.Operations[result.RequestID] = value
+	s.Operations[key] = value
 	return result, nil
 }
 
-func (s *MemoryStore) MarkComplete(_ context.Context, id string) error {
+func (s *MemoryStore) MarkComplete(_ context.Context, proxyID, id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	value, ok := s.Operations[id]
+	key := storeKey(proxyID, id)
+	value, ok := s.Operations[key]
 	if !ok {
 		return ErrOperationNotFound
 	}
 	value.State = StateComplete
-	s.Operations[id] = value
+	s.Operations[key] = value
 	return nil
 }
 
@@ -180,6 +190,8 @@ func cloneCallback(value StoredCallback) StoredCallback {
 	}
 	return value
 }
+
+func storeKey(proxyID, id string) string { return proxyID + "\x00" + id }
 
 var _ Store = (*MemoryStore)(nil)
 var _ CallbackStore = (*MemoryStore)(nil)

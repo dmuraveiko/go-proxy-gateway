@@ -112,7 +112,7 @@ func (c *Client) start(initialCtx context.Context, request Request) (*operationR
 	if err := c.store.SaveOutgoing(initialCtx, request); err != nil {
 		return nil, fmt.Errorf("persist outgoing request: %w", err)
 	}
-	stored, err := c.store.Load(initialCtx, request.RequestID)
+	stored, err := c.store.Load(initialCtx, request.ProxyID, request.RequestID)
 	if err != nil {
 		return nil, fmt.Errorf("load outgoing request: %w", err)
 	}
@@ -177,7 +177,7 @@ func (c *Client) execute(ctx context.Context, req Request) (Result, error) {
 	}
 	// From durable acceptance onward the protocol finishes independently from the
 	// caller's request context. This is required to persist/ACK a late result.
-	if err := c.store.MarkAccepted(ctx, req.RequestID); err != nil {
+	if err := c.store.MarkAccepted(ctx, req.ProxyID, req.RequestID); err != nil {
 		return Result{}, fmt.Errorf("persist acceptance: %w", err)
 	}
 	acceptACK := contracts.DeliveryACK{RequestID: req.RequestID, DeliveryID: acceptance.DeliveryID, ClientID: c.cfg.ClientID}
@@ -190,7 +190,7 @@ func (c *Client) execute(ctx context.Context, req Request) (Result, error) {
 		case <-ctx.Done():
 			return Result{}, ctx.Err()
 		case result := <-resultCh:
-			effective, err := c.store.SaveResult(ctx, result)
+			effective, err := c.store.SaveResult(ctx, req.ProxyID, result)
 			if err != nil {
 				return Result{}, fmt.Errorf("persist HTTP result: %w", err)
 			}
@@ -198,7 +198,7 @@ func (c *Client) execute(ctx context.Context, req Request) (Result, error) {
 			if err = c.ackUntilConfirmed(ctx, "proxy."+c.cfg.ProxyID+".result_acks", contracts.TypeResultACK, ack); err != nil {
 				return Result{}, err
 			}
-			if err = c.store.MarkComplete(ctx, req.RequestID); err != nil {
+			if err = c.store.MarkComplete(ctx, req.ProxyID, req.RequestID); err != nil {
 				return Result{}, err
 			}
 			if effective.State == "unknown" {
@@ -237,7 +237,7 @@ func (c *Client) ackUntilConfirmed(ctx context.Context, subject, typ string, ack
 }
 
 func (c *Client) resumePending() {
-	operations, err := c.store.ListPending(c.ctx, 10_000)
+	operations, err := c.store.ListPending(c.ctx, c.cfg.ProxyID, 10_000)
 	if err != nil {
 		return
 	}

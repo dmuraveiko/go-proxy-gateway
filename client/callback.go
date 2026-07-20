@@ -149,7 +149,7 @@ func (c *Client) ServeCallbacks(handler http.Handler) error {
 
 func (c *Client) handleCallback(ctx context.Context, store CallbackStore, handler http.Handler, message *nats.Msg) {
 	var event contracts.WebhookEvent
-	if c.decode(message, contracts.TypeWebhookEvent, &event) != nil || event.DeliveryID == "" {
+	if c.decode(message, contracts.TypeWebhookEvent, &event) != nil || event.DeliveryID == "" || event.ProxyID != c.cfg.ProxyID {
 		return
 	}
 	if !c.beginCallback(event.DeliveryID) {
@@ -228,7 +228,7 @@ func (c *Client) deliverCallbackResponse(ctx context.Context, store CallbackStor
 	for {
 		if !saved {
 			saveCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-			saveErr := store.SaveCallbackResponse(saveCtx, response)
+			saveErr := store.SaveCallbackResponse(saveCtx, event.ProxyID, response)
 			cancel()
 			saved = saveErr == nil
 			if errors.Is(saveErr, ErrOperationNotFound) || errors.Is(saveErr, ErrRequestConflict) {
@@ -266,7 +266,7 @@ func (c *Client) publishCallbackResponse(ctx context.Context, subject string, re
 func (c *Client) markCallbackComplete(ctx context.Context, store CallbackStore, deliveryID string) error {
 	delay := c.cfg.RetryInterval
 	for {
-		if err := store.MarkCallbackComplete(ctx, deliveryID); err == nil {
+		if err := store.MarkCallbackComplete(ctx, c.cfg.ProxyID, deliveryID); err == nil {
 			return nil
 		}
 		timer := time.NewTimer(delay)
@@ -281,7 +281,7 @@ func (c *Client) markCallbackComplete(ctx context.Context, store CallbackStore, 
 }
 
 func (c *Client) resumeCallbacks(store CallbackStore) {
-	callbacks, err := store.ListPendingCallbacks(c.ctx, 10_000)
+	callbacks, err := store.ListPendingCallbacks(c.ctx, c.cfg.ProxyID, 10_000)
 	if err != nil {
 		return
 	}

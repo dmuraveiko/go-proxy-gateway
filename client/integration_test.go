@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/dmuraveiko/go-proxy-gateway/internal/contracts"
 	"github.com/dmuraveiko/go-proxy-gateway/internal/message"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/nats-io/nats.go"
 )
 
@@ -159,7 +161,7 @@ func TestIntegrationSavedCallbackResponseSkipsHandler(t *testing.T) {
 	unique := time.Now().Format("150405.000000000")
 	event := contracts.WebhookEvent{
 		EventID: "recover-event-" + unique, DeliveryID: "recover-delivery-" + unique,
-		WebhookID: "recover-webhook", Method: http.MethodPost, RequestURI: "/recover",
+		ProxyID: "proxy-main", WebhookID: "recover-webhook", Method: http.MethodPost, RequestURI: "/recover",
 		ReplySubject: "test.callback.responses." + unique,
 	}
 	if _, err := store.SaveCallback(context.Background(), event); err != nil {
@@ -169,7 +171,7 @@ func TestIntegrationSavedCallbackResponseSkipsHandler(t *testing.T) {
 		EventID: event.EventID, DeliveryID: event.DeliveryID, ClientID: "dev-client",
 		StatusCode: http.StatusCreated, Body: []byte("saved-response"),
 	}
-	if err := store.SaveCallbackResponse(context.Background(), response); err != nil {
+	if err := store.SaveCallbackResponse(context.Background(), event.ProxyID, response); err != nil {
 		t.Fatal(err)
 	}
 
@@ -211,7 +213,7 @@ func TestIntegrationSavedCallbackResponseSkipsHandler(t *testing.T) {
 	}
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		pending, listErr := store.ListPendingCallbacks(context.Background(), 100)
+		pending, listErr := store.ListPendingCallbacks(context.Background(), event.ProxyID, 100)
 		if listErr == nil {
 			found := false
 			for _, callback := range pending {
@@ -227,6 +229,130 @@ func TestIntegrationSavedCallbackResponseSkipsHandler(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatal("saved callback response was not marked complete")
+}
+
+func TestIntegrationPostgresStoreSeparatesTheSameIDByProxy(t *testing.T) {
+	dsn := os.Getenv("PROXY_INTEGRATION_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("integration PostgreSQL is not configured")
+	}
+	store, err := OpenPostgresStore(context.Background(), dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	requestID := "shared-id-" + time.Now().Format("150405.000000000")
+	requestA := Request{RequestID: requestID, ProxyID: "proxy-a", ClientID: "dev-client", Method: http.MethodGet, URL: "https://example.test/a"}
+	requestB := Request{RequestID: requestID, ProxyID: "proxy-b", ClientID: "dev-client", Method: http.MethodGet, URL: "https://example.test/b"}
+	if err = store.SaveOutgoing(context.Background(), requestA); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.SaveOutgoing(context.Background(), requestB); err != nil {
+		t.Fatal(err)
+	}
+	loadedA, err := store.Load(context.Background(), requestA.ProxyID, requestID)
+	if err != nil || loadedA.Request.URL != requestA.URL {
+		t.Fatalf("proxy A operation: %+v err=%v", loadedA, err)
+	}
+	loadedB, err := store.Load(context.Background(), requestB.ProxyID, requestID)
+	if err != nil || loadedB.Request.URL != requestB.URL {
+		t.Fatalf("proxy B operation: %+v err=%v", loadedB, err)
+	}
+
+	deliveryID := "shared-delivery-" + requestID
+	eventA := contracts.WebhookEvent{EventID: "event-a-" + requestID, DeliveryID: deliveryID, ProxyID: "proxy-a", WebhookID: "webhook-a"}
+	eventB := contracts.WebhookEvent{EventID: "event-b-" + requestID, DeliveryID: deliveryID, ProxyID: "proxy-b", WebhookID: "webhook-b"}
+	if _, err = store.SaveCallback(context.Background(), eventA); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.SaveCallback(context.Background(), eventB); err != nil {
+		t.Fatal(err)
+	}
+	callbacksA, err := store.ListPendingCallbacks(context.Background(), eventA.ProxyID, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	callbacksB, err := store.ListPendingCallbacks(context.Background(), eventB.ProxyID, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !containsCallback(callbacksA, eventA) || containsCallback(callbacksA, eventB) || !containsCallback(callbacksB, eventB) || containsCallback(callbacksB, eventA) {
+		t.Fatalf("callbacks are not isolated: proxy-a=%+v proxy-b=%+v", callbacksA, callbacksB)
+	}
+}
+
+func TestIntegrationPostgresStoreMigratesLegacyPrimaryKeys(t *testing.T) {
+	dsn := os.Getenv("PROXY_INTEGRATION_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("integration PostgreSQL is not configured")
+	}
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	prefix := fmt.Sprintf("migration_%d_", time.Now().UnixNano())
+	operations := quoteIdentifier(prefix + "operations")
+	callbacks := quoteIdentifier(prefix + "callback_events")
+	defer func() {
+		_, _ = pool.Exec(ctx, fmt.Sprintf(`DROP TABLE IF EXISTS %s,%s`, operations, callbacks))
+	}()
+	legacySchema := fmt.Sprintf(`
+CREATE TABLE %s (
+  request_id text PRIMARY KEY,
+  request jsonb NOT NULL,
+  result jsonb,
+  state text NOT NULL CHECK (state IN ('outgoing','accepted','result_saved','complete')),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE %s (
+  delivery_id text PRIMARY KEY,
+  event jsonb NOT NULL,
+  completed boolean NOT NULL DEFAULT false,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);`, operations, callbacks)
+	if _, err = pool.Exec(ctx, legacySchema); err != nil {
+		t.Fatal(err)
+	}
+	legacyRequest := Request{RequestID: "legacy-id", ProxyID: "proxy-a", ClientID: "client-a", Method: http.MethodGet, URL: "https://example.test/legacy"}
+	requestPayload, _ := json.Marshal(legacyRequest)
+	if _, err = pool.Exec(ctx, fmt.Sprintf(`INSERT INTO %s(request_id,request,state) VALUES($1,$2,'outgoing')`, operations), legacyRequest.RequestID, requestPayload); err != nil {
+		t.Fatal(err)
+	}
+	legacyEvent := contracts.WebhookEvent{EventID: "legacy-event", DeliveryID: "legacy-delivery", WebhookID: "legacy-webhook"}
+	eventPayload, _ := json.Marshal(legacyEvent)
+	if _, err = pool.Exec(ctx, fmt.Sprintf(`INSERT INTO %s(delivery_id,event) VALUES($1,$2)`, callbacks), legacyEvent.DeliveryID, eventPayload); err != nil {
+		t.Fatal(err)
+	}
+	store, err := NewPostgresStore(ctx, pool, WithTablePrefix(prefix))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.Load(ctx, legacyRequest.ProxyID, legacyRequest.RequestID); err != nil {
+		t.Fatalf("legacy operation was not assigned to its proxy: %v", err)
+	}
+	secondProxy := legacyRequest
+	secondProxy.ProxyID = "proxy-b"
+	secondProxy.URL = "https://example.test/second"
+	if err = store.SaveOutgoing(ctx, secondProxy); err != nil {
+		t.Fatalf("composite operation key was not installed: %v", err)
+	}
+	newEvent := contracts.WebhookEvent{EventID: "new-event", DeliveryID: legacyEvent.DeliveryID, ProxyID: "proxy-b", WebhookID: "new-webhook"}
+	if _, err = store.SaveCallback(ctx, newEvent); err != nil {
+		t.Fatalf("composite callback key was not installed: %v", err)
+	}
+}
+
+func containsCallback(callbacks []StoredCallback, event contracts.WebhookEvent) bool {
+	for _, callback := range callbacks {
+		if callback.Event.ProxyID == event.ProxyID && callback.Event.DeliveryID == event.DeliveryID && callback.Event.EventID == event.EventID {
+			return true
+		}
+	}
+	return false
 }
 
 func callbackPath(raw string) string {

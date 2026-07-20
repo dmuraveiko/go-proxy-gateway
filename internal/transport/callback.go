@@ -210,6 +210,7 @@ func (c *Core) handleWebhookResponse(message *nats.Msg) {
 // DeliverWebhook is the callback direction: public HTTP -> durable DB fan-out ->
 // NATS clients -> optional delegated HTTP response.
 func (c *Core) DeliverWebhook(ctx context.Context, event contracts.WebhookEvent, route repository.WebhookRoute) (contracts.WebhookResponse, error) {
+	event.ProxyID = c.proxyID
 	replySubject := c.webhookResponseSubject()
 	var responseChannel chan contracts.WebhookResponse
 	if route.Mode == "delegated" {
