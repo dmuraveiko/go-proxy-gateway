@@ -14,6 +14,7 @@ import (
 	"github.com/dmuraveiko/go-proxy-gateway/internal/config"
 	"github.com/dmuraveiko/go-proxy-gateway/internal/contracts"
 	"github.com/dmuraveiko/go-proxy-gateway/internal/httpx"
+	"github.com/dmuraveiko/go-proxy-gateway/internal/metrics"
 	"github.com/dmuraveiko/go-proxy-gateway/internal/repository"
 	"github.com/jackc/pgx/v5"
 )
@@ -96,13 +97,16 @@ func (p *Pool) execute(ctx context.Context, op repository.Operation) error {
 	cancel()
 	attempt := op.Attempts + 1
 	if callErr != nil {
+		metrics.HTTPDispatches.WithLabelValues("error").Inc()
 		if p.canRetry(op.Request, attempt, true, 0) {
 			return p.repo.ScheduleRetry(ctx, op.Request.RequestID, op.DispatchToken, callErr.Error(), time.Now().Add(backoff(op.Request.Retry, attempt)))
 		}
 		result = contracts.HTTPResult{State: "unknown", ErrorCode: "http_outcome_unknown", Error: callErr.Error()}
 	} else if p.canRetry(op.Request, attempt, false, result.StatusCode) {
+		metrics.HTTPDispatches.WithLabelValues("retry").Inc()
 		return p.repo.ScheduleRetry(ctx, op.Request.RequestID, op.DispatchToken, fmt.Sprintf("HTTP %d", result.StatusCode), time.Now().Add(backoff(op.Request.Retry, attempt)))
 	} else {
+		metrics.HTTPDispatches.WithLabelValues("success").Inc()
 		result.State = "http_completed"
 	}
 	result.ResultID = "result_" + op.Request.RequestID

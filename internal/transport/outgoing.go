@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/dmuraveiko/go-proxy-gateway/internal/contracts"
+	"github.com/dmuraveiko/go-proxy-gateway/internal/metrics"
 	"github.com/dmuraveiko/go-proxy-gateway/internal/repository"
 	"github.com/jackc/pgx/v5"
 	"github.com/nats-io/nats.go"
@@ -22,9 +23,11 @@ func (c *Core) handleRequest(message *nats.Msg) {
 	defer cancel()
 	client, payload, err := c.decode(message, contracts.TypeHTTPRequest)
 	if err != nil {
+		metrics.NetworkRequests.WithLabelValues("in", "error", "regular").Inc()
 		c.reject("http request", err)
 		return
 	}
+	metrics.NetworkRequests.WithLabelValues("in", "success", "regular").Inc()
 	var request contracts.HTTPRequest
 	if err = json.Unmarshal(payload, &request); err != nil {
 		c.reject("http request", err)
@@ -77,9 +80,11 @@ func (c *Core) handleAcceptanceACK(message *nats.Msg) {
 	defer cancel()
 	client, payload, err := c.decode(message, contracts.TypeAcceptanceACK)
 	if err != nil {
+		metrics.NetworkRequests.WithLabelValues("in", "error", "regular").Inc()
 		c.reject("acceptance ACK", err)
 		return
 	}
+	metrics.NetworkRequests.WithLabelValues("in", "success", "regular").Inc()
 	var ack contracts.DeliveryACK
 	if json.Unmarshal(payload, &ack) != nil || ack.ClientID != client {
 		return
@@ -96,9 +101,11 @@ func (c *Core) handleResultACK(message *nats.Msg) {
 	defer cancel()
 	client, payload, err := c.decode(message, contracts.TypeResultACK)
 	if err != nil {
+		metrics.NetworkRequests.WithLabelValues("in", "error", "regular").Inc()
 		c.reject("result ACK", err)
 		return
 	}
+	metrics.NetworkRequests.WithLabelValues("in", "success", "regular").Inc()
 	var ack contracts.DeliveryACK
 	if json.Unmarshal(payload, &ack) != nil || ack.ClientID != client {
 		return

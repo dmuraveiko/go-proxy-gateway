@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/dmuraveiko/go-proxy-gateway/internal/contracts"
+	"github.com/dmuraveiko/go-proxy-gateway/internal/metrics"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )
@@ -14,9 +15,11 @@ import (
 func (r *Repository) ApplyWebhookControl(ctx context.Context, operation WebhookControlOperation, subject string) (contracts.WebhookControlResult, error) {
 	transaction, err := r.pool.Begin(ctx)
 	if err != nil {
+		metrics.DBRequests.WithLabelValues("out", "error", "callback_registration").Inc()
 		return contracts.WebhookControlResult{}, err
 	}
 	defer transaction.Rollback(ctx)
+	metrics.DBRequests.WithLabelValues("out", "success", "callback_registration").Inc()
 
 	var existingClientID, existingType string
 	var existingPayload, existingResult []byte
@@ -129,8 +132,10 @@ func (r *Repository) GetWebhookRoute(ctx context.Context, webhookID string) (Web
 	var responderClientID *string
 	err := r.pool.QueryRow(ctx, `SELECT webhook_id,owner_client_id,name,path_token_hash,mode,static_response,responder_client_id,response_timeout_ms,max_body_bytes,enabled FROM proxy_webhook_routes WHERE webhook_id=$1`, webhookID).Scan(&route.ID, &route.OwnerClientID, &route.Name, &route.TokenHash, &route.Mode, &staticResponse, &responderClientID, &responseTimeoutMilliseconds, &route.MaxBodyBytes, &route.Enabled)
 	if err != nil {
+		metrics.DBRequests.WithLabelValues("in", "error", "callback").Inc()
 		return route, err
 	}
+	metrics.DBRequests.WithLabelValues("in", "success", "callback").Inc()
 	if responderClientID != nil {
 		route.ResponderClientID = *responderClientID
 	}
@@ -146,9 +151,11 @@ func (r *Repository) SaveWebhookEvent(ctx context.Context, event contracts.Webho
 	}
 	transaction, err := r.pool.Begin(ctx)
 	if err != nil {
+		metrics.DBRequests.WithLabelValues("out", "error", "callback").Inc()
 		return nil, err
 	}
 	defer transaction.Rollback(ctx)
+	metrics.DBRequests.WithLabelValues("out", "success", "callback").Inc()
 	state := "received"
 	if route.Mode == "delegated" {
 		state = "awaiting_response"

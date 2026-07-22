@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/dmuraveiko/go-proxy-gateway/internal/contracts"
+	"github.com/dmuraveiko/go-proxy-gateway/internal/metrics"
 )
 
 func (r *Repository) AcceptHTTPRequest(ctx context.Context, request contracts.HTTPRequest, acceptance contracts.Acceptance, subject string) error {
@@ -20,9 +21,11 @@ func (r *Repository) AcceptHTTPRequest(ctx context.Context, request contracts.HT
 	}
 	transaction, err := r.pool.Begin(ctx)
 	if err != nil {
+		metrics.DBRequests.WithLabelValues("out", "error", "regular").Inc()
 		return err
 	}
 	defer transaction.Rollback(ctx)
+	metrics.DBRequests.WithLabelValues("out", "success", "regular").Inc()
 	tag, err := transaction.Exec(ctx, `INSERT INTO proxy_http_requests(request_id,client_id,proxy_id,request,status) VALUES($1,$2,$3,$4,'awaiting_acceptance_ack') ON CONFLICT(request_id) DO NOTHING`, request.RequestID, request.ClientID, request.ProxyID, requestPayload)
 	if err != nil {
 		return err
@@ -114,9 +117,11 @@ func (r *Repository) SaveHTTPResult(ctx context.Context, token, clientID, subjec
 	}
 	transaction, err := r.pool.Begin(ctx)
 	if err != nil {
+		metrics.DBRequests.WithLabelValues("out", "error", "regular").Inc()
 		return err
 	}
 	defer transaction.Rollback(ctx)
+	metrics.DBRequests.WithLabelValues("out", "success", "regular").Inc()
 	state := "http_completed"
 	if result.State == "unknown" {
 		state = "unknown"

@@ -14,6 +14,7 @@ import (
 
 	"github.com/dmuraveiko/go-proxy-gateway/internal/contracts"
 	"github.com/dmuraveiko/go-proxy-gateway/internal/message"
+	"github.com/dmuraveiko/go-proxy-gateway/internal/metrics"
 	"github.com/dmuraveiko/go-proxy-gateway/internal/repository"
 	"github.com/nats-io/nats.go"
 )
@@ -137,8 +138,10 @@ func (c *Core) PublishRaw(ctx context.Context, subject, messageType string, payl
 		return errors.New("NATS message exceeds configured limit")
 	}
 	if err = c.nc.Publish(subject, data); err != nil {
+		metrics.NetworkRequests.WithLabelValues("out", "error", c.natsKind(subject)).Inc()
 		return err
 	}
+	metrics.NetworkRequests.WithLabelValues("out", "success", c.natsKind(subject)).Inc()
 	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
 		flushContext, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
@@ -192,6 +195,17 @@ func (c *Core) clientSubject(clientID, suffix string) string {
 }
 
 func (c *Core) allowedClient(clientID string) bool { return clientID != "" && c.allowed[clientID] }
+
+func (c *Core) natsKind(subject string) string {
+	switch {
+	case strings.Contains(subject, "webhooks.commands"):
+		return "callback_registration"
+	case strings.Contains(subject, "webhooks"):
+		return "callback"
+	default:
+		return "regular"
+	}
+}
 
 func (c *Core) reject(kind string, err error) {
 	c.log.Warn("NATS message rejected", "kind", kind, "error", err)

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/dmuraveiko/go-proxy-gateway/internal/contracts"
+	"github.com/dmuraveiko/go-proxy-gateway/internal/metrics"
 	"github.com/dmuraveiko/go-proxy-gateway/internal/repository"
 	"github.com/nats-io/nats.go"
 )
@@ -29,9 +30,11 @@ func (c *Core) handleWebhookCommand(message *nats.Msg) {
 	defer cancel()
 	clientID, payload, messageType, err := c.decodeAny(message)
 	if err != nil {
+		metrics.NetworkRequests.WithLabelValues("in", "error", "callback_registration").Inc()
 		c.reject("webhook command", err)
 		return
 	}
+	metrics.NetworkRequests.WithLabelValues("in", "success", "callback_registration").Inc()
 	operation, err := c.webhookControlOperation(clientID, messageType, payload)
 	if err != nil {
 		c.reject("webhook command", err)
@@ -169,8 +172,10 @@ func (c *Core) handleWebhookDeliveryACK(message *nats.Msg, messageType string, c
 	defer cancel()
 	clientID, payload, err := c.decode(message, messageType)
 	if err != nil {
+		metrics.NetworkRequests.WithLabelValues("in", "error", "callback").Inc()
 		return
 	}
+	metrics.NetworkRequests.WithLabelValues("in", "success", "callback").Inc()
 	var ack contracts.DeliveryACK
 	if json.Unmarshal(payload, &ack) != nil || ack.ClientID != clientID {
 		return
@@ -185,8 +190,10 @@ func (c *Core) handleWebhookResponse(message *nats.Msg) {
 	defer cancel()
 	clientID, payload, err := c.decode(message, contracts.TypeWebhookDelegatedResponse)
 	if err != nil {
+		metrics.NetworkRequests.WithLabelValues("in", "error", "callback").Inc()
 		return
 	}
+	metrics.NetworkRequests.WithLabelValues("in", "success", "callback").Inc()
 	var response contracts.WebhookResponse
 	if json.Unmarshal(payload, &response) != nil || response.ClientID != clientID {
 		return

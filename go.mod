@@ -5,6 +5,7 @@ go 1.25.0
 require (
 	github.com/jackc/pgx/v5 v5.7.6
 	github.com/nats-io/nats.go v1.52.0
+	github.com/prometheus/client_golang v1.22.0
 )
 
 require (

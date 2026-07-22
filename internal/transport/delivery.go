@@ -5,6 +5,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/dmuraveiko/go-proxy-gateway/internal/metrics"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -27,6 +28,7 @@ func (c *Core) deliveryLoop(ctx context.Context) error {
 			continue
 		}
 		if err = c.PublishRaw(ctx, delivery.Subject, delivery.MessageType, delivery.Payload); err != nil {
+			metrics.DeliveryRetries.WithLabelValues(c.natsKind(delivery.Subject)).Inc()
 			c.log.Warn("core NATS delivery failed", "delivery_id", delivery.ID, "error", err)
 		}
 		if err = c.repo.RescheduleDelivery(ctx, delivery.ID, c.deliveryRetry); err != nil && ctx.Err() == nil {

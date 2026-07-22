@@ -6,7 +6,6 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"errors"
-	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -16,7 +15,9 @@ import (
 	"time"
 
 	"github.com/dmuraveiko/go-proxy-gateway/internal/contracts"
+	"github.com/dmuraveiko/go-proxy-gateway/internal/metrics"
 	"github.com/dmuraveiko/go-proxy-gateway/internal/repository"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 type WebhookTransport interface {
@@ -73,20 +74,19 @@ func (a *App) readiness(w http.ResponseWriter, r *http.Request) {
 func (a *App) metrics(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), time.Second)
 	defer cancel()
-	s, err := a.repo.Stats(ctx)
-	if err != nil {
-		http.Error(w, "metrics unavailable", http.StatusServiceUnavailable)
-		return
+	if s, err := a.repo.Stats(ctx); err == nil {
+		metrics.DeliveriesPending.Set(float64(s.Deliveries))
 	}
-	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
-	fmt.Fprintf(w, "proxy_requests{status=\"awaiting_ack\"} %d\nproxy_requests{status=\"ready\"} %d\nproxy_requests{status=\"dispatching\"} %d\nproxy_requests{status=\"completed\"} %d\nproxy_requests{status=\"unknown\"} %d\nproxy_deliveries_pending %d\n", s.AwaitingACK, s.Ready, s.Dispatching, s.Completed, s.Unknown, s.Deliveries)
+	promhttp.Handler().ServeHTTP(w, r)
 }
 func (a *App) webhook(w http.ResponseWriter, r *http.Request) {
 	route, err := a.repo.GetWebhookRoute(r.Context(), r.PathValue("id"))
 	if err != nil || !route.Enabled || !tokenOK(r.PathValue("token"), route.TokenHash) {
+		metrics.DBRequests.WithLabelValues("out", "error", "callback").Inc()
 		http.NotFound(w, r)
 		return
 	}
+	metrics.DBRequests.WithLabelValues("out", "success", "callback").Inc()
 	limit := route.MaxBodyBytes
 	if limit <= 0 || limit > a.maxBody {
 		limit = a.maxBody
